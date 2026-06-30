@@ -1026,9 +1026,8 @@ class SistemaReconocimientoFacial:
                 
                 if roi_w > 40 and roi_h > 40:
                     roi_frame = frame_pequeno[ry1:ry2, rx1:rx2]
-                    # Ejecutar inferencia en el RoI (redimensionado a 200x150 para máxima eficiencia)
-                    roi_small = cv2.resize(roi_frame, (200, 150))
-                    blob = cv2.dnn.blobFromImage(roi_small, 1.0, (150, 150), (104.0, 177.0, 123.0))
+                    # Inferencia en el RoI (el modelo SSD requiere blob de 300x300 exactamente)
+                    blob = cv2.dnn.blobFromImage(roi_frame, 1.0, (300, 300), (104.0, 177.0, 123.0))
                     self.net.setInput(blob)
                     detections = self.net.forward()
                     
@@ -1039,7 +1038,7 @@ class SistemaReconocimientoFacial:
                             x_start = rx1 + int(detections[0, 0, i, 3] * roi_w)
                             y_start = ry1 + int(detections[0, 0, i, 4] * roi_h)
                             x_end = rx1 + int(detections[0, 0, i, 5] * roi_w)
-                            y_end = ry1 + int(detections[0, 0, i, 6] * roi_h)
+                            y_end = rx1 + int(detections[0, 0, i, 6] * roi_h)
                             
                             caras_combinadas.append((x_start, y_start, x_end - x_start, y_end - y_start))
                             
@@ -1054,9 +1053,8 @@ class SistemaReconocimientoFacial:
             # Si no hay RoI activo o falló, escaneamos el frame completo cada 3 fotogramas (o si es frame 1)
             if escanear_completo:
                 if self.contador_frames % 3 == 0 or self.roi_box is None:
-                    # Inferencia en el frame completo redimensionado para velocidad
-                    frame_detect_small = cv2.resize(frame_pequeno, (300, 225))
-                    blob = cv2.dnn.blobFromImage(frame_detect_small, 1.0, (200, 200), (104.0, 177.0, 123.0))
+                    # Inferencia en el frame completo (requiere blob de 300x300 exactamente)
+                    blob = cv2.dnn.blobFromImage(frame_pequeno, 1.0, (300, 300), (104.0, 177.0, 123.0))
                     self.net.setInput(blob)
                     detections = self.net.forward()
                     
