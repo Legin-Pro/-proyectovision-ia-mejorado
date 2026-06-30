@@ -1058,23 +1058,31 @@ class SistemaReconocimientoFacial:
                                 nombre_detectado = self.nombres_usuarios.get(id_prediccion, "Desconocido")
                                 self.memoria_deteccion.append(nombre_detectado)
                             else:
+                                nombre_detectado = "Desconocido"
                                 self.memoria_deteccion.append("Desconocido")
                                 
+                            # A. Estabilización de conversación mediante voto acumulado
                             if len(self.memoria_deteccion) > 0:
                                 voto_ganador = max(set(self.memoria_deteccion), key=self.memoria_deteccion.count)
                             else:
                                 voto_ganador = "Desconocido"
-                                
                             votos_winner = self.memoria_deteccion.count(voto_ganador)
                             
-                            if voto_ganador != "Desconocido" and votos_winner >= 4:
-                                etiqueta = f"ACTIVO: {voto_ganador.upper()}"
-                                subtitulo = f"Match: {confianza_pct:.1f}% ({votos_winner}/7 frames)"
+                            # B. Dibujar información de manera individual para este rostro
+                            if nombre_detectado != "Desconocido":
+                                etiqueta = f"ACTIVO: {nombre_detectado.upper()}"
+                                subtitulo = f"Match: {confianza_pct:.1f}%"
                                 color = (0, 255, 0)
-                                
                                 self.consecutivos_desconocidos = 0
-                                nombre_actual_en_camara = voto_ganador
+                                nombre_actual_en_camara = nombre_detectado
+                            else:
+                                etiqueta = "DESCONOCIDO"
+                                subtitulo = f"Match: {confianza_pct:.1f}%"
+                                color = (0, 0, 255)
+                                self.consecutivos_desconocidos += 1
                                 
+                            # C. Disparar interacción y auto-aprendizaje solo para la persona ganadora y validada
+                            if voto_ganador != "Desconocido" and votos_winner >= 4 and nombre_detectado == voto_ganador:
                                 ahora_chat = time.time()
                                 if ahora_chat - self.ultimo_chat_voz.get(voto_ganador, 0) > 90.0:
                                     self.ultimo_chat_voz[voto_ganador] = ahora_chat
@@ -1086,11 +1094,6 @@ class SistemaReconocimientoFacial:
                                 if ahora_t - ultimo_guardado_interactivo > 3.0:
                                     self.auto_capturar_rostro_interaccion(voto_ganador, cara_gris_recortada, w)
                                     ultimo_guardado_interactivo = ahora_t
-                            else:
-                                etiqueta = "DESCONOCIDO"
-                                subtitulo = "Identificando..."
-                                color = (0, 0, 255)
-                                self.consecutivos_desconocidos += 1
                                 
                         except Exception as e:
                             subtitulo = f"Error IA: {e}"
