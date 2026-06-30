@@ -1063,9 +1063,19 @@ class SistemaReconocimientoFacial:
                         try:
                             cara_gris_norm = self.preprocesar_rostro_extremo(cara_gris_recortada)
                             id_prediccion, distancia = self.recognizer.predict(cara_gris_norm)
-                            confianza_pct = max(0, 100 - distancia)
                             
-                            if confianza_pct > 48:
+                            # Mapear la distancia matemática de LBPH a una escala de confianza biométrica intuitiva (0% - 100%)
+                            if distancia < 40:
+                                confianza_pct = 95.0 + (40 - distancia) * 0.125
+                            elif distancia < 52:
+                                confianza_pct = 80.0 + (52 - distancia) * 1.25
+                            elif distancia < 70:
+                                confianza_pct = 40.0 + (70 - distancia) * 2.22
+                            else:
+                                confianza_pct = max(0.0, 40.0 - (distancia - 70) * 2.0)
+                                
+                            # Umbral estricto basado en la distancia del histograma LBPH (distancia < 52 es un match seguro)
+                            if distancia < 52:
                                 nombre_detectado = self.nombres_usuarios.get(id_prediccion, "Desconocido")
                         except Exception as e:
                             print(f"[IA Predict Error] {e}")
