@@ -991,6 +991,12 @@ class SistemaReconocimientoFacial:
             frame_original = frame.copy()
             h_orig, w_orig = frame.shape[:2]
             
+            # --- OPTIMIZACIÓN DE FPS ---
+            escala = 2
+            ancho_red = w_orig // escala
+            alto_red = h_orig // escala
+            frame_pequeno = cv2.resize(frame, (ancho_red, alto_red))
+            
             # --- RECARGA DE MODELO SEGURA EN CALIENTE ---
             if self.necesita_recargar_modelo:
                 self.cargar_modelo()
