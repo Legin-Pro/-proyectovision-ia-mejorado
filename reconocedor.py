@@ -44,7 +44,7 @@ asistente_hablando = False
 
 def hablar_worker():
     """Ejecuta en segundo plano la síntesis de voz usando Microsoft Edge Neural TTS (Voz Humana) 
-    o SAPI5 como fallback local offline."""
+    con formato SSML expresivo o SAPI5 como fallback local offline."""
     global asistente_hablando
     pythoncom.CoInitialize()
     
@@ -78,13 +78,28 @@ def hablar_worker():
                 asistente_hablando = True
                 hablado_con_edge = False
                 
-                # Intentar usar Edge Neural TTS si edge_tts está instalado
+                # Intentar usar Edge Neural TTS con SSML si edge_tts está instalado
                 try:
                     import edge_tts
+                    
+                    # Formatear a SSML con prosodia expresiva (pitch y rate ajustados + pausas naturales)
+                    texto_limpio = texto.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                    texto_pausado = texto_limpio.replace(", ", ", <break time='180ms'/> ")
+                    texto_pausado = texto_pausado.replace(". ", ". <break time='320ms'/> ")
+                    texto_pausado = texto_pausado.replace("? ", "? <break time='350ms'/> ")
+                    texto_pausado = texto_pausado.replace("! ", "! <break time='350ms'/> ")
+                    
+                    ssml_texto = f"""<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='es-MX'>
+                        <voice name='es-MX-DaliaNeural'>
+                            <prosody pitch='+3Hz' rate='+4%' volume='100'>
+                                {texto_pausado}
+                            </prosody>
+                        </voice>
+                    </speak>"""
+                    
                     # Generar audio asíncronamente
                     async def generar():
-                        # Usamos es-MX-DaliaNeural para una voz cálida, natural e increíblemente fluida
-                        communicate = edge_tts.Communicate(texto, "es-MX-DaliaNeural")
+                        communicate = edge_tts.Communicate(ssml_texto, "es-MX-DaliaNeural")
                         await communicate.save(temp_audio)
                     
                     import asyncio
@@ -93,11 +108,18 @@ def hablar_worker():
                     if player is not None and os.path.exists(temp_audio):
                         player.URL = temp_audio
                         player.controls.play()
-                        # Esperar a que termine de reproducir
-                        time.sleep(0.2) # Pequeño margen para iniciar
-                        # Esperar mientras esté en estado de reproducción (3 = wmppsPlaying, 9 = wmppsTransitioning)
-                        while player.playState in [3, 9, 6]: 
+                        
+                        # Esperar a que comience la reproducción
+                        time.sleep(0.15)
+                        
+                        # Esperar mientras esté en estado de reproducción (3=Playing, 9=Transitioning, 6=Buffering)
+                        while player.playState in [3, 9, 6]:
                             time.sleep(0.05)
+                            
+                        # Pequeño delay de 250ms para evitar que se corte el final de la última palabra
+                        time.sleep(0.25)
+                        player.URL = ""  # Desvincular el archivo de audio para liberarlo
+                        time.sleep(0.1)
                         hablado_con_edge = True
                 except Exception as e:
                     # Si falla por internet o librería no instalada, pasará al fallback
