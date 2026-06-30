@@ -271,7 +271,7 @@ class SistemaReconocimientoFacial:
                 "Content-Type": "application/json"
             }
             data = {
-                "model": "llama3-8b-8192",
+                "model": "llama-3.1-8b-instant",
                 "messages": messages,
                 "max_tokens": 100,  # Aumentado para frases completas y fluidas
                 "temperature": 0.95  # Alta temperatura para mayor creatividad y variación léxica
@@ -283,6 +283,8 @@ class SistemaReconocimientoFacial:
                 if tipo == "chat":
                     self.historial_conversacion.append({"role": "assistant", "content": frase})
                 return frase
+            else:
+                print(f"[Groq API Error] HTTP {res.status_code}: {res.text}")
         except Exception as e:
             print(f"[Groq LLM Error] Fallback local activo: {e}")
             
@@ -576,8 +578,9 @@ class SistemaReconocimientoFacial:
             return
             
         print(f"[VOZ A TEXTO] Transcripción recibida: '{texto_limpio}'")
+        texto_lower = texto_limpio.lower()
         
-        # A. Si ya está escuchando activamente el nombre del usuario para el registro
+        # A. Si ya está escuchando activamente el nombre del usuario durante el registro guiado
         if self.registro_estado == "escuchando":
             palabras = texto_limpio.split()
             nombre = None
@@ -593,44 +596,46 @@ class SistemaReconocimientoFacial:
                 nombre = ''.join(c for c in nombre if c.isalnum()).capitalize()
             self.input_nombre_resultado = nombre
             self.registro_estado = "procesando_voz"
+            return
             
-        # B. Si el chat conversacional ya está activo
-        elif self.chat_estado is not None:
+        # B. Comprobar comandos globales de registro (siempre tienen prioridad alta)
+        # 1. Comando de registro directo: "Me llamo Carlos" o "Mi nombre es Maria"
+        if "me llamo " in texto_lower or "mi nombre es " in texto_lower:
+            palabras = texto_limpio.split()
+            nombre = None
+            for idx, pal in enumerate(palabras):
+                if pal.lower() in ["llamo", "es"] and idx + 1 < len(palabras):
+                    nombre = palabras[idx+1]
+                    break
+            if nombre:
+                nombre = ''.join(c for c in nombre if c.isalnum()).capitalize()
+                if len(nombre) >= 2:
+                    # Cerrar chat previo si estaba activo
+                    self.chat_estado = None
+                    self.registro_nombre = nombre
+                    self.registro_estado = "capturando_dinamico"
+                    self.registro_timer = time.time()
+                    self.registro_fotos_guardadas = 0
+                    self.encolar_saludo_groq("durante_registro", nombre)
+                    print(f"[AUTO-REGISTRO] Asistente iniciado directamente vía voz para '{nombre}'")
+                    return
+        
+        # 2. Comando de registro guiado: "Registrar", "Nuevo usuario", etc.
+        elif any(cmd in texto_lower for cmd in ["registrar", "registro", "nuevo usuario", "agregar usuario"]):
+            print("[VOZ] Comando de inicio de registro detectado.")
+            # Cerrar chat previo si estaba activo
+            self.chat_estado = None
+            self.iniciar_registro_autonomo()
+            return
+
+        # C. Si ya hay un chat conversacional activo
+        if self.chat_estado is not None:
             print("[FLUJO IA] Enviando texto a la conversación activa con Groq...")
             self.chat_estado = "procesando_usuario"
             threading.Thread(target=self.procesar_charla_worker, args=(texto_limpio,), daemon=True).start()
             
-        # C. Si el sistema está en reposo (buscando rostros)
-        elif self.chat_estado is None and self.registro_estado is None:
-            texto_lower = texto_limpio.lower()
-            
-            # 1. Comando de registro directo: "Me llamo Miguel" o "Mi nombre es Maria"
-            if "me llamo " in texto_lower or "mi nombre es " in texto_lower:
-                palabras = texto_limpio.split()
-                nombre = None
-                for idx, pal in enumerate(palabras):
-                    if pal.lower() in ["llamo", "es"] and idx + 1 < len(palabras):
-                        nombre = palabras[idx+1]
-                        break
-                if nombre:
-                    nombre = ''.join(c for c in nombre if c.isalnum()).capitalize()
-                    # Salir si el nombre es demasiado genérico/incorrecto (como "Un" o "De")
-                    if len(nombre) >= 2:
-                        self.registro_nombre = nombre
-                        self.registro_estado = "capturando_dinamico"
-                        self.registro_timer = time.time()
-                        self.registro_fotos_guardadas = 0
-                        self.encolar_saludo_groq("durante_registro", nombre)
-                        print(f"[AUTO-REGISTRO] Asistente iniciado directamente vía voz para '{nombre}'")
-                        return
-            
-            # 2. Comando de registro guiado: "Registrar", "Nuevo usuario", etc.
-            elif any(cmd in texto_lower for cmd in ["registrar", "registro", "nuevo usuario", "agregar usuario"]):
-                print("[VOZ] Comando de inicio de registro detectado.")
-                self.iniciar_registro_autonomo()
-                return
-                
-            # 3. Charla conversacional normal por defecto
+        # D. Si el sistema está en reposo (buscando rostros)
+        else:
             nombre = "Extraño"
             if self.cara_detectada_nombre and self.cara_detectada_nombre != "Desconocido":
                 nombre = self.cara_detectada_nombre
