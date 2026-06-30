@@ -14,6 +14,7 @@ import io
 import wave
 import sounddevice as sd
 import mediapipe as mp
+from mediapipe.python.solutions import face_detection as mp_face_detection
 from collections import deque
 import tkinter as tk
 from tkinter import simpledialog
@@ -86,7 +87,7 @@ class SistemaReconocimientoFacial:
     def __init__(self):
         # --- INTEGRACIÓN DE MEDIAPIPE FACE DETECTION (PRECISIÓN EXTREMA A LARGA DISTANCIA) ---
         # model_selection=1 configura el modelo de rango completo (óptimo hasta 5 metros)
-        self.mp_face_detection = mp.solutions.face_detection
+        self.mp_face_detection = mp_face_detection
         self.face_detector = self.mp_face_detection.FaceDetection(
             min_detection_confidence=0.55,
             model_selection=1
