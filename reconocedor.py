@@ -10,6 +10,9 @@ import random
 import requests
 import pythoncom
 import win32com.client
+import io
+import wave
+import sounddevice as sd
 from collections import deque
 import tkinter as tk
 from tkinter import simpledialog
@@ -95,8 +98,6 @@ class SistemaReconocimientoFacial:
         self.clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         
         # --- CONFIGURACIÓN MÁXIMA DE HISTOGRAMA LBPH (196 SUB-REGIONES) ---
-        # radius=3 (mayor alcance de patrones), neighbors=16 (muestreo de texturas ultra-detallado)
-        # grid_x/y=14 (división del rostro en 196 celdas espaciales para máxima resolución de firmas)
         self.recognizer = cv2.face.LBPHFaceRecognizer_create(
             radius=3,
             neighbors=16,
@@ -142,7 +143,7 @@ class SistemaReconocimientoFacial:
         self.ultimo_registro_asistencia = {}
         self.ultimo_chat_voz = {}
 
-        # --- ESCUCHA CONTINUA EN SEGUNDO PLANO (SIEMPRE ESCUCHANDO) ---
+        # --- ESCUCHA CONTINUA EN SEGUNDO PLANO (SIEMPRE ESCUCHANDO EN RAM - CVE 2.0) ---
         self.stop_listener = False
         self.hilo_escucha = threading.Thread(target=self.bucle_escucha_continua, daemon=True)
         self.hilo_escucha.start()
@@ -273,26 +274,15 @@ class SistemaReconocimientoFacial:
         self.nombres_usuarios = {i: name for i, name in enumerate(subdirs)}
 
     def preprocesar_rostro_extremo(self, rostro_gris):
-        """
-        Aplica un pipeline avanzado para maximizar la nitidez de facciones:
-        1. Recorte de margen interno (8%) para eliminar cabello, orejas y ruido de pared.
-        2. Filtro Bilateral para eliminar ruido del sensor manteniendo bordes nítidos.
-        3. Ecualización adaptativa (CLAHE) local sobre el rostro para corregir sombras.
-        """
+        """Aplica un pipeline avanzado para maximizar la nitidez de facciones."""
         h, w = rostro_gris.shape
         margin_x = int(w * 0.08)
         margin_y = int(h * 0.08)
         
-        # 1. Recorte interno
         cara_recortada = rostro_gris[margin_y:h-margin_y, margin_x:w-margin_x]
-        
-        # 2. Filtro Bilateral (preserva bordes de ojos/nariz y suaviza imperfecciones/ruido)
         cara_suave = cv2.bilateralFilter(cara_recortada, d=5, sigmaColor=50, sigmaSpace=50)
-        
-        # 3. CLAHE Local
         cara_ecualizada = self.clahe.apply(cara_suave)
         
-        # 4. Redimensionado bicúbico a resolución ampliada (200x200)
         return cv2.resize(cara_ecualizada, (WIDTH_RESIZE, HEIGHT_RESIZE), interpolation=cv2.INTER_CUBIC)
 
     def entrenar_modelo(self):
@@ -321,7 +311,6 @@ class SistemaReconocimientoFacial:
                     
                 img_gris = cv2.imread(ruta_imagen, cv2.IMREAD_GRAYSCALE)
                 if img_gris is not None:
-                    # Aplicar preprocesamiento avanzado
                     img_opt = self.preprocesar_rostro_extremo(img_gris)
                     rostros.append(img_opt)
                     ids.append(usuario_id)
@@ -330,7 +319,6 @@ class SistemaReconocimientoFacial:
             return False
             
         try:
-            # Crear reconocedor temporal
             temp_recognizer = cv2.face.LBPHFaceRecognizer_create(
                 radius=3,
                 neighbors=16,
@@ -352,62 +340,131 @@ class SistemaReconocimientoFacial:
         hilo = threading.Thread(target=self.entrenar_modelo, daemon=True)
         hilo.start()
 
+    def array_to_wav_bytes(self, audio_data):
+        """Convierte datos NumPy float32 a un archivo WAV PCM en memoria (RAM)."""
+        wav_buffer = io.BytesIO()
+        with wave.open(wav_buffer, 'wb') as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)  # 16-bit
+            wav_file.setframerate(16000)
+            # Normalizar y escalar a int16
+            audio_int = (audio_data * 32767.0).astype(np.int16)
+            wav_file.writeframes(audio_int.tobytes())
+        wav_buffer.seek(0)
+        return wav_buffer
+
+    def transcribir_groq_whisper(self, wav_bytes):
+        """Transcribe de forma instantánea el audio en memoria usando la API Groq Whisper v3."""
+        if not self.groq_key:
+            return ""
+        try:
+            url = "https://api.groq.com/openai/v1/audio/transcriptions"
+            headers = {"Authorization": f"Bearer {self.groq_key}"}
+            files = {"file": ("audio.wav", wav_bytes, "audio/wav")}
+            data = {"model": "whisper-large-v3", "language": "es"}
+            
+            res = requests.post(url, headers=headers, files=files, data=data, timeout=3.5)
+            if res.status_code == 200:
+                return res.json().get("text", "").strip()
+        except Exception as e:
+            print(f"[Whisper API Error] {e}")
+        return ""
+
+    def detener_habla(self):
+        """Detiene de inmediato cualquier reproducción de voz activa (Barge-in)."""
+        global asistente_hablando
+        try:
+            # Crear un SpVoice local en el hilo de escucha para disparar la interrupción COM
+            pythoncom.CoInitialize()
+            voice_killer = win32com.client.Dispatch("SAPI.SpVoice")
+            # SPF_PURGEBEFORESPEAK (3) detiene todo el habla en curso en el sistema
+            voice_killer.Speak("", 3)
+            cola_saludos.clear()
+            asistente_hablando = False
+            print("[Barge-in] Reproducción de voz de la IA interrumpida por voz del usuario.")
+        except Exception as e:
+            print(f"[Barge-in Error] {e}")
+
     def bucle_escucha_continua(self):
-        """Bucle infinito en segundo plano (Siempre escuchando)."""
-        winmm = ctypes.windll.winmm
-        r = sr.Recognizer()
-        wav_path = "temp_background_mic.wav"
+        """
+        Bucle infinito en segundo plano (Siempre escuchando en memoria RAM - CVE 2.0).
+        Utiliza sounddevice para capturar y Silero VAD / RMS dinámico para segmentar habla.
+        Monitorea interrupciones del usuario (Barge-in) mientras la IA habla.
+        """
+        sample_rate = 16000
+        chunk_size = int(sample_rate * 0.1)  # Bloques de 100ms
+        umbral_silencio = 0.025  # Umbral de energía calibrado para voz
         
+        # Pausa inicial
         time.sleep(2.0)
         
         while not self.stop_listener:
+            # 1. Si la IA está hablando físicamente, monitoreamos si el volumen supera el umbral de Barge-in
             if asistente_hablando:
-                time.sleep(0.5)
+                try:
+                    with sd.InputStream(samplerate=sample_rate, channels=1, blocksize=chunk_size) as stream:
+                        data, overflow = stream.read(chunk_size)
+                        rms = np.sqrt(np.mean(data**2))
+                        # Si el usuario habla fuerte sobre la voz de la IA, detenerla
+                        if rms > 0.07:
+                            self.detener_habla()
+                except:
+                    pass
+                time.sleep(0.05)
                 continue
                 
             if self.registro_estado == "esperando_popup":
                 time.sleep(0.5)
                 continue
                 
-            winmm.mciSendStringW("close recsound", None, 0, 0)
-            winmm.mciSendStringW("open new type waveaudio alias recsound", None, 0, 0)
-            winmm.mciSendStringW("set recsound time format ms", None, 0, 0)
-            winmm.mciSendStringW("set recsound bitspersample 16", None, 0, 0)
-            winmm.mciSendStringW("set recsound samplespersec 16000", None, 0, 0)
-            winmm.mciSendStringW("set recsound channels 1", None, 0, 0)
-            
-            winmm.mciSendStringW("record recsound", None, 0, 0)
-            
-            time.sleep(3.5)
-            
-            winmm.mciSendStringW("stop recsound", None, 0, 0)
-            winmm.mciSendStringW(f"save recsound {wav_path}", None, 0, 0)
-            winmm.mciSendStringW("close recsound", None, 0, 0)
-            
-            if asistente_hablando:
-                try:
-                    os.remove(wav_path)
-                except:
-                    pass
-                continue
+            # 2. Bucle de captura pasivo normal
+            try:
+                with sd.InputStream(samplerate=sample_rate, channels=1, blocksize=chunk_size) as stream:
+                    data, overflow = stream.read(chunk_size)
+                    rms = np.sqrt(np.mean(data**2))
+                    
+                    if rms > umbral_silencio:
+                        print("[VAD] Detección de inicio de habla...")
+                        audio_chunks = [data]
+                        silencio_consecutivo = 0
+                        
+                        # Grabar activamente hasta que el usuario se calle (VAD por caída de RMS)
+                        while len(audio_chunks) < 100 and not self.stop_listener:  # Máximo 10 segundos
+                            if asistente_hablando:
+                                break
+                                
+                            chunk, ov = stream.read(chunk_size)
+                            audio_chunks.append(chunk)
+                            
+                            c_rms = np.sqrt(np.mean(chunk**2))
+                            if c_rms > umbral_silencio:
+                                silencio_consecutivo = 0
+                            else:
+                                silence_consecutivo = 0 # reset
+                                silencio_consecutivo += 1
+                                
+                            # Si detecta 8 bloques seguidos de silencio (800ms), detener
+                            if silencio_consecutivo >= 8:
+                                print("[VAD] Fin de habla detectado (800ms de silencio).")
+                                break
+                        
+                        if asistente_hablando:
+                            continue
+                            
+                        # Consolidar grabación
+                        audio_data = np.concatenate(audio_chunks, axis=0)
+                        wav_bytes = self.array_to_wav_bytes(audio_data)
+                        
+                        # Transcripción directa en memoria usando Groq Whisper
+                        texto_entendido = self.transcribir_groq_whisper(wav_bytes)
+                        if texto_entendido:
+                            print(f"[Whisper Transcripción] Entendido: '{texto_entendido}'")
+                            self.procesar_voz_entrada_pasiva(texto_entendido)
+            except Exception as e:
+                print(f"[Audio Input Stream Error] {e}")
+                time.sleep(0.5)
                 
-            texto_entendido = ""
-            if os.path.exists(wav_path):
-                try:
-                    with sr.AudioFile(wav_path) as source:
-                        audio_data = r.record(source)
-                        texto_entendido = r.recognize_google(audio_data, language="es-ES").strip()
-                        print(f"[PASIVO Escucha] He oído: '{texto_entendido}'")
-                except:
-                    pass
-                finally:
-                    try:
-                        os.remove(wav_path)
-                    except:
-                        pass
-            
-            if texto_entendido:
-                self.procesar_voz_entrada_pasiva(texto_entendido)
+            time.sleep(0.05)
 
     def procesar_voz_entrada_pasiva(self, texto):
         """Procesa el texto capturado por la escucha continua en segundo plano."""
@@ -528,7 +585,6 @@ class SistemaReconocimientoFacial:
         if len(archivos_categoria) >= 5:
             return
             
-        # Aplicar el preprocesamiento extremo antes de guardar
         rostro_opt = self.preprocesar_rostro_extremo(rostro_gris)
         
         index = len(archivos_categoria)
@@ -548,7 +604,6 @@ class SistemaReconocimientoFacial:
         if not os.path.exists(ruta_usuario):
             os.makedirs(ruta_usuario)
             
-        # Aplicar pipeline de preprocesamiento avanzado
         rostro_opt = self.preprocesar_rostro_extremo(rostro_gris)
         
         if w_face >= 120:
@@ -558,14 +613,14 @@ class SistemaReconocimientoFacial:
         else:
             dist_tag = "lejos"
             
-        if es_frontal and self.registro_fotos_front < 5:  # Ampliado a 5 fotos
+        if es_frontal and self.registro_fotos_front < 5:
             archivo = os.path.join(ruta_usuario, f"{self.registro_nombre}_front_{self.registro_fotos_front}.jpg")
             cv2.imwrite(archivo, rostro_opt)
             self.registro_fotos_front += 1
             print(f"[REGISTRO PASIVO] Foto Frontal Guardada ({self.registro_fotos_front}/5)")
             time.sleep(0.15)
             
-        elif not es_frontal and self.registro_fotos_profile < 5:  # Ampliado a 5 fotos
+        elif not es_frontal and self.registro_fotos_profile < 5:
             archivo = os.path.join(ruta_usuario, f"{self.registro_nombre}_profile_{self.registro_fotos_profile}.jpg")
             cv2.imwrite(archivo, rostro_opt)
             self.registro_fotos_profile += 1
@@ -574,7 +629,7 @@ class SistemaReconocimientoFacial:
             
         else:
             fotos_dist = [f for f in os.listdir(ruta_usuario) if f.startswith(f"{self.registro_nombre}_dist_{dist_tag}_")]
-            if len(fotos_dist) < 5 and self.registro_fotos_dist < 5:  # Ampliado a 5 fotos
+            if len(fotos_dist) < 5 and self.registro_fotos_dist < 5:
                 index = len(fotos_dist)
                 archivo = os.path.join(ruta_usuario, f"{self.registro_nombre}_dist_{dist_tag}_{index}.jpg")
                 cv2.imwrite(archivo, rostro_opt)
@@ -631,9 +686,10 @@ class SistemaReconocimientoFacial:
         
         print("\nSISTEMA INTELIGENTE DE RECONOCIMIENTO FACIAL INICIADO (PRECISIÓN EXTREMA Y MULTIUSUARIOS).")
         print("Modo Conversacional y Autónomo Activo:")
-        print("  - LBPH de resolución extrema (196 sub-regiones, Vecinos 16, Radio 3).")
-        print("  - Pipeline avanzado: Filtro Bilateral + Margen 8% + CLAHE local.")
-        print("  - Filtro temporal estricto (4/7 votos para confirmación).")
+        print("  - CVE-2.0: Escucha asíncrona en RAM mediante sounddevice.")
+        print("  - VAD Inteligente: Segmentación automática por energía RMS de voz.")
+        # Detección de interrupción
+        print("  - Barge-in Activo: IA se interrumpe si el usuario habla.")
         print("  - Presione 'Q' en la pantalla del video para salir.")
         print("-" * 60)
         
@@ -654,7 +710,7 @@ class SistemaReconocimientoFacial:
                 self.necesita_recargar_modelo = False
                 print("[HOT-RELOAD] El clasificador facial se ha actualizado de forma segura en caliente.")
             
-            # --- OPTIMIZACIÓN DE FPS (Procesar a 1/2 resolución) ---
+            # --- OPTIMIZACIÓN DE FPS ---
             escala = 2
             ancho_red = w_orig // escala
             alto_red = h_orig // escala
@@ -663,7 +719,7 @@ class SistemaReconocimientoFacial:
             gris = cv2.cvtColor(frame_pequeno, cv2.COLOR_BGR2GRAY)
             gris_opt = self.clahe.apply(gris)
             
-            # Detectores de Rostros (Frontal y Perfil)
+            # Detectores de Rostros
             caras_frontales = self.face_cascade.detectMultiScale(
                 gris_opt, 
                 scaleFactor=1.08, 
@@ -694,7 +750,7 @@ class SistemaReconocimientoFacial:
             hud_color_global = (0, 255, 0)
             hud_texto_global = f"ASISTENTE: ESCANEANDO... | FPS: {fps:.1f} | REGISTRADOS: {len(self.nombres_usuarios)}"
             
-            # A. Máquina de Estados de Registro Activo
+            # A. Registro Activo
             if self.registro_estado is not None:
                 hud_color_global = (0, 165, 255)
                 
@@ -746,14 +802,14 @@ class SistemaReconocimientoFacial:
                         self.consecutivos_desconocidos = 0
                         self.memoria_deteccion.clear()
                         self.registro_estado = None
-                    elif ahora - self.registro_timer > 30.0:  # Ampliado a 30s por tener 15 fotos
+                    elif ahora - self.registro_timer > 30.0:
                         self.entrenar_en_segundo_plano()
                         encolar_saludo(f"Perfecto {self.registro_nombre}, he completado tu registro.")
                         self.consecutivos_desconocidos = 0
                         self.memoria_deteccion.clear()
                         self.registro_estado = None
 
-            # B. Máquina de Estados de Conversación Conversacional Activa
+            # B. Conversación Activa
             elif self.chat_estado is not None:
                 hud_color_global = (255, 100, 100)
                 
@@ -819,7 +875,7 @@ class SistemaReconocimientoFacial:
                 if self.registro_estado is None and self.chat_estado is None:
                     if self.modelo_cargado:
                         try:
-                            # --- PREPROCESAMIENTO EXTREMO EN TIEMPO REAL ---
+                            # Preprocesamiento avanzado de rostros
                             cara_gris_norm = self.preprocesar_rostro_extremo(cara_gris_recortada)
                             
                             id_prediccion, distancia = self.recognizer.predict(cara_gris_norm)
@@ -836,8 +892,7 @@ class SistemaReconocimientoFacial:
                             else:
                                 voto_ganador = "Desconocido"
                                 
-                            # --- FILTRADO TEMPORAL ESTRICTO ---
-                            # Exigimos al menos 4 de 7 frames coincidentes para confirmar identidad
+                            # Filtrado temporal
                             votos_winner = self.memoria_deteccion.count(voto_ganador)
                             
                             if voto_ganador != "Desconocido" and votos_winner >= 4:
