@@ -108,6 +108,7 @@ class SistemaReconocimientoFacial:
         self.modelo_cargado = False
         self.necesita_recargar_modelo = False
         self.nombres_usuarios = {}
+        self.limpiar_dataset_ruido()
         self.cargar_modelo()
         
         # Leer clave API de Groq del archivo local .env
@@ -352,6 +353,22 @@ class SistemaReconocimientoFacial:
         subdirs = sorted([d for d in os.listdir(DATASET_DIR) if os.path.isdir(os.path.join(DATASET_DIR, d))])
         self.nombres_usuarios = {i: name for i, name in enumerate(subdirs)}
 
+    def limpiar_dataset_ruido(self):
+        """Limpia carpetas del dataset que correspondan a falsas activaciones por ruido de voz."""
+        if not os.path.exists(DATASET_DIR):
+            return
+        nombres_ruido = {"de", "un", "gracias", "ok", "si", "no", "hola", "el", "la", "en", "con", "por", "para", "que"}
+        for d in os.listdir(DATASET_DIR):
+            ruta_d = os.path.join(DATASET_DIR, d)
+            if os.path.isdir(ruta_d):
+                if d.lower() in nombres_ruido or len(d) < 2:
+                    print(f"[SISTEMA] Limpiando carpeta de ruido detectada en dataset: {d}")
+                    try:
+                        import shutil
+                        shutil.rmtree(ruta_d)
+                    except Exception as e:
+                        print(f"[ERROR] No se pudo limpiar la carpeta {d}: {e}")
+
     def preprocesar_rostro_extremo(self, rostro_gris):
         """Aplica un pipeline avanzado para maximizar la nitidez de facciones."""
         h, w = rostro_gris.shape
@@ -390,8 +407,8 @@ class SistemaReconocimientoFacial:
                     
                 img_gris = cv2.imread(ruta_imagen, cv2.IMREAD_GRAYSCALE)
                 if img_gris is not None:
-                    img_opt = self.preprocesar_rostro_extremo(img_gris)
-                    rostros.append(img_opt)
+                    # Las imágenes del dataset ya están totalmente optimizadas, recortadas y ecualizadas al guardarse
+                    rostros.append(img_gris)
                     ids.append(usuario_id)
         
         if len(rostros) == 0:
