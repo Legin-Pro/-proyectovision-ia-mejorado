@@ -4,12 +4,12 @@ import os
 import time
 import csv
 import threading
-import pyttsx3
 import winsound
 import ctypes
 import random
 import requests
 import pythoncom
+import win32com.client
 from collections import deque
 import tkinter as tk
 from tkinter import simpledialog
@@ -30,56 +30,27 @@ HEIGHT_RESIZE = 150
 if not os.path.exists(DATASET_DIR):
     os.makedirs(DATASET_DIR)
 
-# =====================================================================
-# DICCIONARIOS DE FRASES HUMANIZADAS LOCALES (FALLBACK)
-# =====================================================================
-FRASES_SALUDOS_CONOCIDOS = [
-    "¡Hola [nombre]! Qué bueno verte por aquí.",
-    "Hola [nombre], ¿cómo va tu día?",
-    "Qué tal [nombre], un placer saludarte de nuevo.",
-    "Hola de nuevo, [nombre]. Te veo genial hoy.",
-    "¡Hola [nombre]! Acceso verificado."
-]
-
-FRASES_SALUDOS_NUEVOS = [
-    "¡Hola! Oye, estaba revisando y no te tengo en mi base de datos. ¿Cómo te llamas?",
-    "Hola. Qué curioso, no te reconozco. ¿Me dirías tu nombre por favor?",
-    "¡Qué tal! Veo una cara nueva. ¿Cuál es tu nombre?",
-    "Hola, no te tengo registrado todavía. ¿Cómo te llamas?"
-]
-
-FRASES_DURANTE_REGISTRO = [
-    "¡Qué bien, [nombre]! Un gusto conocerte. Quédate ahí charlando conmigo mientras configuro tu perfil.",
-    "Un placer, [nombre]. Solo quédate ahí un momento, estoy analizando tus ángulos en segundo plano.",
-    "Estupendo, [nombre]. Háblame un poco o muévete despacio, estoy registrando tus facciones.",
-    "Excelente, [nombre]. Ya tengo tu nombre. Sigue mirándome un momento."
-]
-
-FRASES_REGISTRO_COMPLETO = [
-    "¡Todo listo! Ya registré tu rostro en mi base de datos. Un placer conocerte, [nombre].",
-    "Perfecto, [nombre]. Configuración terminada. Ya sé quién eres.",
-    "Listo, [nombre]. Registro completado con éxito. Ahora ya te reconozco.",
-    "Hecho, [nombre]. He asimilado tus firmas faciales."
-]
-
 # Hilo para la reproducción de voz (evita que el bucle de video se congele)
 voz_lock = threading.Lock()
 cola_saludos = deque(maxlen=5)
 
+# Variable global para saber si el asistente está hablando físicamente
+asistente_hablando = False
+
 def hablar_worker():
-    """Ejecuta en segundo plano la síntesis de voz inicializando COM para SAPI5 en Windows."""
-    # Inicialización obligatoria de COM para habilitar voz en hilos de Windows (SAPI5)
+    """Ejecuta en segundo plano la síntesis de voz usando SAPI5 nativo de Windows (win32com)."""
+    global asistente_hablando
     pythoncom.CoInitialize()
     try:
-        engine = pyttsx3.init()
-        voices = engine.getProperty('voices')
-        for voice in voices:
-            if "spanish" in voice.name.lower() or "es" in voice.id.lower():
-                engine.setProperty('voice', voice.id)
+        voice = win32com.client.Dispatch("SAPI.SpVoice")
+        voices = voice.GetVoices()
+        for i in range(voices.Count):
+            v_desc = voices.Item(i).GetDescription()
+            if "spanish" in v_desc.lower() or "español" in v_desc.lower() or "es-ES" in v_desc.lower():
+                voice.Voice = voices.Item(i)
                 break
-        engine.setProperty('rate', 160)
     except Exception as e:
-        print(f"[Voz Error] No se pudo inicializar el motor de voz: {e}")
+        print(f"[Voz Error] No se pudo instanciar SAPI5: {e}")
         return
 
     while True:
@@ -87,10 +58,12 @@ def hablar_worker():
             texto = cola_saludos.popleft()
             with voz_lock:
                 try:
-                    engine.say(texto)
-                    engine.runAndWait()
+                    asistente_hablando = True
+                    voice.Speak(texto, 0)  # Síncrono dentro del hilo de voz
+                    asistente_hablando = False
                 except Exception as e:
-                    print(f"[Voz Error] Error al reproducir audio: {e}")
+                    print(f"[Voz Error] Error de reproducción SAPI5: {e}")
+                    asistente_hablando = False
         else:
             time.sleep(0.1)
 
@@ -132,6 +105,7 @@ class SistemaReconocimientoFacial:
         
         # Historial de detecciones para estabilizar predicciones
         self.memoria_deteccion = deque(maxlen=7)
+        self.cara_detectada_nombre = None  # Nombre de la persona actualmente en cámara
         
         # --- SEGUIDOR POR CENTROIDES (ID TEMPORAL) ---
         self.ultimo_centroide = None  # (cx, cy)
@@ -141,29 +115,29 @@ class SistemaReconocimientoFacial:
         self.registro_nombre = ""
         self.registro_timer = 0
         
-        # Conteo de fotos por categorías de pose para evitar saturación
         self.registro_fotos_front = 0
         self.registro_fotos_profile = 0
         self.registro_fotos_dist = 0
         
         # --- MÁQUINA DE ESTADOS DE CONVERSACIÓN ACTIVA (LLM CHAT) ---
-        # Estados: None (escaneo), "iniciando_chat", "esperando_habla", "escuchando_usuario", "procesando_usuario"
         self.chat_estado = None
         self.chat_nombre = ""
         self.chat_timer = 0
-        self.historial_conversacion = deque(maxlen=6)  # Almacena el contexto de charla
+        self.historial_conversacion = deque(maxlen=6)
         
-        # Variables de control de hilos de voz e inputs
+        # Variables de control de hilos
         self.input_nombre_resultado = None
         self.consecutivos_desconocidos = 0
         self.fotos_auto_guardadas = 0
-        
-        # Cooldown temporal de registros en CSV (15 segundos)
         self.ultimo_registro_asistencia = {}
         
-        # Cooldown de chat por voz (para no iniciar charla automáticamente cada segundo si el usuario está en cámara)
-        # Se puede volver a chatear después de 90 segundos de inactividad
+        # Cooldown de chat por voz por usuario (60 segundos)
         self.ultimo_chat_voz = {}
+
+        # --- ESCUCHA CONTINUA EN SEGUNDO PLANO (SIEMPRE ESCUCHANDO) ---
+        self.stop_listener = False
+        self.hilo_escucha = threading.Thread(target=self.bucle_escucha_continua, daemon=True)
+        self.hilo_escucha.start()
 
     def cargar_groq_key(self):
         """Carga la clave API de Groq desde el archivo local .env."""
@@ -180,27 +154,35 @@ class SistemaReconocimientoFacial:
         return None
 
     def generar_frase_llm(self, tipo, nombre=None, texto_conversacion=None):
-        """Genera una frase contextual humanizada usando Groq Llama-3 o fallback local."""
+        """Genera una frase contextual humanizada y con personalidad usando Groq Llama-3."""
         if not self.groq_key:
             if tipo == "chat":
                 return "No tengo conexión a internet para charlar en este momento."
             return self.generar_frase_local(tipo, nombre)
             
-        system_content = f"Eres Alexa, el asistente de voz en español de un sistema de visión artificial. Tu interlocutor es {nombre if nombre else 'un extraño'}. Responde siempre de forma muy breve, amigable, natural y con chispa (máximo 15 palabras). Nunca uses markdown, asteriscos, guiones ni comillas."
+        # --- PERSONALIDAD DE LA IA: Carismática, ingeniosa, con toques de humor e inteligente ---
+        persona = nombre if nombre else "un extraño"
+        system_content = (
+            f"Eres Alexa, una inteligencia artificial de visión muy ingeniosa, carismática y simpática. "
+            f"Interactúas con {persona}. Responde SIEMPRE en español, con un tono muy amigable, ingenioso, "
+            f"divertido y breve (máximo 15 palabras). Evita respuestas aburridas o predecibles. No uses markdown, asteriscos ni comillas."
+        )
         
         if tipo == "chat" and texto_conversacion:
-            # Añadir mensaje al historial
             self.historial_conversacion.append({"role": "user", "content": texto_conversacion})
             messages = [{"role": "system", "content": system_content}] + list(self.historial_conversacion)
         else:
             if tipo == "saludo_conocido":
-                prompt = f"Genera un saludo muy corto y casual (máximo 12 palabras) en español para un usuario conocido llamado {nombre}. Ej: '¡Hola Carlos! Qué bueno verte, ¿cómo va todo?'"
+                prompt = (
+                    f"Genera un saludo ocurrente y casual (máximo 12 palabras) para {nombre}. "
+                    f"Ej: '¡Vaya, al fin apareces {nombre}! Estaba aburriéndome de ver la pared.'"
+                )
             elif tipo == "saludo_nuevo":
-                prompt = "Genera una frase muy corta (máximo 12 palabras) en español para decirle a un extraño que es una cara nueva y preguntarle su nombre de forma casual y educada."
+                prompt = "Dime que no te tengo registrado de una forma divertida e ingeniosa, y pídeme mi nombre (máximo 12 palabras)."
             elif tipo == "durante_registro":
-                prompt = f"Genera una frase muy corta (máximo 12 palabras) en español para decirle a {nombre} que te alegra conocerle y que continúe mirándote un momento mientras analizas sus rasgos en segundo plano."
+                prompt = f"Dile a {nombre} con entusiasmo que ya sabes su nombre y que se mueva libremente mientras terminas de registrarle (máximo 12 palabras)."
             elif tipo == "registro_completo":
-                prompt = f"Genera una frase de bienvenida muy corta (máximo 12 palabras) en español para decirle a {nombre} que el registro terminó con éxito y ya lo tienes registrado."
+                prompt = f"Dile a {nombre} que el registro ha terminado con éxito y haz un comentario gracioso de bienvenida (máximo 12 palabras)."
             else:
                 return self.generar_frase_local(tipo, nombre)
                 
@@ -219,14 +201,13 @@ class SistemaReconocimientoFacial:
                 "model": "llama3-8b-8192",
                 "messages": messages,
                 "max_tokens": 45,
-                "temperature": 0.8
+                "temperature": 0.85
             }
             res = requests.post(url, headers=headers, json=data, timeout=1.8)
             if res.status_code == 200:
                 result = res.json()
                 frase = result["choices"][0]["message"]["content"].strip().replace('"', '')
                 if tipo == "chat":
-                    # Registrar respuesta en el historial
                     self.historial_conversacion.append({"role": "assistant", "content": frase})
                 return frase
         except Exception as e:
@@ -324,67 +305,111 @@ class SistemaReconocimientoFacial:
         hilo = threading.Thread(target=self.entrenar_modelo, daemon=True)
         hilo.start()
 
-    def grabar_audio_mci_worker(self):
+    def bucle_escucha_continua(self):
         """
-        Graba audio del micrófono en segundo plano configurando la tarjeta a 16kHz Mono.
-        Esto optimiza al máximo la precisión del motor de Speech Recognition.
+        Bucle infinito en segundo plano (Siempre escuchando).
+        Escucha y procesa audio de forma asíncrona sin bloquear la cámara.
+        Evita el feedback acústico pausando la grabación cuando el asistente habla.
         """
         winmm = ctypes.windll.winmm
-        wav_path = "registro_voz_temp.wav"
-        
-        winmm.mciSendStringW("close recsound", None, 0, 0)
-        
-        # --- MEJORA DE MICRÓFONO: Configuración a 16000Hz, 16 bits y canal Mono ---
-        winmm.mciSendStringW("open new type waveaudio alias recsound", None, 0, 0)
-        winmm.mciSendStringW("set recsound time format ms", None, 0, 0)
-        winmm.mciSendStringW("set recsound bitspersample 16", None, 0, 0)
-        winmm.mciSendStringW("set recsound samplespersec 16000", None, 0, 0)
-        winmm.mciSendStringW("set recsound channels 1", None, 0, 0)
-        
-        winmm.mciSendStringW("record recsound", None, 0, 0)
-        
-        # Grabar durante 4.5 segundos
-        time.sleep(4.5)
-        
-        winmm.mciSendStringW("stop recsound", None, 0, 0)
-        winmm.mciSendStringW(f"save recsound {wav_path}", None, 0, 0)
-        winmm.mciSendStringW("close recsound", None, 0, 0)
-        
         r = sr.Recognizer()
-        nombre_transcrito = None
-        if os.path.exists(wav_path):
-            try:
-                with sr.AudioFile(wav_path) as source:
-                    audio_data = r.record(source)
-                    transcripcion = r.recognize_google(audio_data, language="es-ES")
-                    print(f"[Voz Entendida] {transcripcion}")
-                    
-                    # Si es modo conversación regular, devolver la frase completa
-                    if self.chat_estado is not None:
-                        nombre_transcrito = transcripcion
-                    else:
-                        # Si es modo registro de nombre, extraer el nombre único
-                        palabras = transcripcion.strip().split()
-                        if palabras:
-                            if len(palabras) >= 3 and palabras[0].lower() in ["me", "mi"] and palabras[1].lower() in ["llamo", "nombre"]:
-                                nombre_transcrito = palabras[2]
-                            else:
-                                nombre_transcrito = palabras[0]
-            except Exception as e:
-                print(f"[Voz Error] {e}")
-            finally:
+        wav_path = "temp_background_mic.wav"
+        
+        # Pausa inicial para estabilizar cámara
+        time.sleep(2.0)
+        
+        while not self.stop_listener:
+            # 1. EVITAR FEEDBACK ACÚSTICO: Si Alexa está hablando físicamente, no grabar.
+            if asistente_hablando:
+                time.sleep(0.5)
+                continue
+                
+            # 2. Si el sistema está registrando un nombre por popup, pausar escucha continua
+            if self.registro_estado == "esperando_popup":
+                time.sleep(0.5)
+                continue
+                
+            # 3. Grabar fragmento de audio de 3.5 segundos en el hilo
+            winmm.mciSendStringW("close recsound", None, 0, 0)
+            winmm.mciSendStringW("open new type waveaudio alias recsound", None, 0, 0)
+            winmm.mciSendStringW("set recsound time format ms", None, 0, 0)
+            winmm.mciSendStringW("set recsound bitspersample 16", None, 0, 0)
+            winmm.mciSendStringW("set recsound samplespersec 16000", None, 0, 0)
+            winmm.mciSendStringW("set recsound channels 1", None, 0, 0)
+            
+            winmm.mciSendStringW("record recsound", None, 0, 0)
+            
+            # Grabar por 3.5 segundos
+            time.sleep(3.5)
+            
+            # Detener y guardar
+            winmm.mciSendStringW("stop recsound", None, 0, 0)
+            winmm.mciSendStringW(f"save recsound {wav_path}", None, 0, 0)
+            winmm.mciSendStringW("close recsound", None, 0, 0)
+            
+            # Si Alexa empezó a hablar justo al terminar la grabación, descartar para evitar feedback
+            if asistente_hablando:
                 try:
                     os.remove(wav_path)
                 except:
                     pass
-        
-        self.input_nombre_resultado = nombre_transcrito
-        
-        # Redirigir según el estado activo
-        if self.chat_estado == "escuchando_usuario":
-            self.chat_estado = "procesando_usuario"
-        else:
+                continue
+                
+            # 4. Transcribir el audio en segundo plano
+            texto_entendido = ""
+            if os.path.exists(wav_path):
+                try:
+                    with sr.AudioFile(wav_path) as source:
+                        audio_data = r.record(source)
+                        texto_entendido = r.recognize_google(audio_data, language="es-ES").strip()
+                        print(f"[PASIVO Escucha] He oído: '{texto_entendido}'")
+                except:
+                    pass
+                finally:
+                    try:
+                        os.remove(wav_path)
+                    except:
+                        pass
+            
+            # 5. Procesar lo escuchado según el estado actual
+            if texto_entendido:
+                self.procesar_voz_entrada_pasiva(texto_entendido)
+
+    def procesar_voz_entrada_pasiva(self, texto):
+        """Procesa el texto capturado por la escucha continua en segundo plano."""
+        # A. Si estamos en modo Registro Autónomo esperando el Nombre por micrófono
+        if self.registro_estado == "escuchando":
+            palabras = texto.strip().split()
+            nombre = None
+            if palabras:
+                if len(palabras) >= 3 and palabras[0].lower() in ["me", "mi"] and palabras[1].lower() in ["llamo", "nombre"]:
+                    nombre = palabras[2]
+                else:
+                    nombre = palabras[0]
+            self.input_nombre_resultado = nombre
             self.registro_estado = "procesando_voz"
+            
+        # B. Si estamos en medio de un chat activo
+        elif self.chat_estado is not None:
+            # Procesar chat de forma asíncrona
+            self.chat_estado = "procesando_usuario"
+            threading.Thread(target=self.procesar_charla_worker, args=(texto,), daemon=True).start()
+            
+        # C. Si estamos en modo escaneo normal, pero hay una persona frente a la cámara y habla
+        elif self.chat_estado is None and self.registro_estado is None:
+            # Si hay una persona conocida detectada recientemente
+            if self.cara_detectada_nombre and self.cara_detectada_nombre != "Desconocido":
+                nombre = self.cara_detectada_nombre
+                # Iniciar la conversación usando el texto dicho como primera intervención
+                self.chat_nombre = nombre
+                self.chat_estado = "procesando_usuario"
+                self.historial_conversacion.clear()
+                
+                print(f"[CONVERSACIÓN INICIADA PASIVAMENTE] {nombre} dijo: '{texto}'")
+                self.ultimo_chat_voz[nombre] = time.time()
+                
+                # Lanzar respuesta
+                threading.Thread(target=self.procesar_charla_worker, args=(texto,), daemon=True).start()
 
     def solicitar_nombre_popup_worker(self):
         """Diálogo de Tkinter en segundo plano."""
@@ -424,7 +449,6 @@ class SistemaReconocimientoFacial:
         print(f"[CONVERSACIÓN] Alexa: {respuesta}")
         encolar_saludo(respuesta)
         
-        # Verificar si el usuario dijo adiós para terminar el chat
         palabras_cierre = ["adiós", "adios", "chao", "bye", "salir", "nos vemos", "gracias"]
         cerrar_conversacion = False
         for pc in palabras_cierre:
@@ -435,9 +459,31 @@ class SistemaReconocimientoFacial:
         if cerrar_conversacion:
             self.chat_estado = None
         else:
-            # Volver a escuchar
-            self.chat_estado = "esperando_habla"
+            # Volver a escuchar de forma pasiva
             self.chat_timer = time.time()
+            self.chat_estado = "esperando_habla"
+
+    def guardar_asistencia(self, nombre, confianza):
+        """Registra la asistencia en un archivo CSV aplicando cooldown."""
+        ahora = time.time()
+        if nombre in self.ultimo_registro_asistencia:
+            if ahora - self.ultimo_registro_asistencia[nombre] < 15:
+                return
+                
+        self.ultimo_registro_asistencia[nombre] = ahora
+        fecha_actual = time.strftime("%Y-%m-%d")
+        hora_actual = time.strftime("%H:%M:%S")
+        
+        archivo_nuevo = not os.path.exists(ATTENDANCE_FILE)
+        try:
+            with open(ATTENDANCE_FILE, mode='a', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                if archivo_nuevo:
+                    writer.writerow(["Nombre", "Fecha", "Hora", "Confianza (%)"])
+                writer.writerow([nombre, fecha_actual, hora_actual, f"{confianza:.2f}%"])
+            print(f"[CSV LOG] Asistencia registrada para {nombre} (Match: {confianza:.1f}%)")
+        except Exception as e:
+            print(f"[CSV ERROR] No se pudo guardar en CSV: {e}")
 
     def auto_capturar_rostro_interaccion(self, nombre, rostro_gris, w_face):
         """
@@ -472,17 +518,13 @@ class SistemaReconocimientoFacial:
             self.entrenar_en_segundo_plano()
 
     def procesar_captura_pasiva(self, rostro_gris, w_face, es_frontal):
-        """
-        Guarda silenciosa e implícitamente las caras en diferentes poses y distancias
-        durante el proceso de registro activo (Alexa Style) sin interrumpir el video.
-        """
+        """Guarda silenciosa e implícitamente las caras en diferentes poses y distancias."""
         ruta_usuario = os.path.join(DATASET_DIR, self.registro_nombre)
         if not os.path.exists(ruta_usuario):
             os.makedirs(ruta_usuario)
             
         rostro_red = cv2.resize(rostro_gris, (WIDTH_RESIZE, HEIGHT_RESIZE), interpolation=cv2.INTER_CUBIC)
         
-        # Categorizar por distancia
         if w_face >= 120:
             dist_tag = "cerca"
         elif w_face >= 60:
@@ -490,7 +532,6 @@ class SistemaReconocimientoFacial:
         else:
             dist_tag = "lejos"
             
-        # 1. Si la pose es frontal, guardarla en "front"
         if es_frontal and self.registro_fotos_front < 3:
             archivo = os.path.join(ruta_usuario, f"{self.registro_nombre}_front_{self.registro_fotos_front}.jpg")
             cv2.imwrite(archivo, rostro_red)
@@ -498,7 +539,6 @@ class SistemaReconocimientoFacial:
             print(f"[REGISTRO PASIVO] Foto Frontal Guardada ({self.registro_fotos_front}/3)")
             time.sleep(0.15)
             
-        # 2. Si la pose es perfil, guardarla en "profile"
         elif not es_frontal and self.registro_fotos_profile < 3:
             archivo = os.path.join(ruta_usuario, f"{self.registro_nombre}_profile_{self.registro_fotos_profile}.jpg")
             cv2.imwrite(archivo, rostro_red)
@@ -506,7 +546,6 @@ class SistemaReconocimientoFacial:
             print(f"[REGISTRO PASIVO] Foto Perfil Guardada ({self.registro_fotos_profile}/3)")
             time.sleep(0.15)
             
-        # 3. Guardar por variación de distancia en "dist"
         else:
             fotos_dist = [f for f in os.listdir(ruta_usuario) if f.startswith(f"{self.registro_nombre}_dist_{dist_tag}_")]
             if len(fotos_dist) < 3 and self.registro_fotos_dist < 3:
@@ -566,7 +605,7 @@ class SistemaReconocimientoFacial:
         
         print("\nSISTEMA INTELIGENTE DE RECONOCIMIENTO FACIAL INICIADO.")
         print("Modo Conversacional y Autónomo Activo:")
-        print("  - Voz funcional habilitada en hilos mediante CoInitialize.")
+        print("  - Voz funcional habilitada en hilos mediante CoInitialize y win32com.")
         print("  - Diálogos inteligentes bidireccionales con Groq Llama-3.")
         print("  - Grabación de micrófono a 16kHz Mono optimizada para alta precisión.")
         print("  - Presione 'Q' en la pantalla del video para salir.")
@@ -625,7 +664,7 @@ class SistemaReconocimientoFacial:
             
             # A. Máquina de Estados de Registro Activo
             if self.registro_estado is not None:
-                hud_color_global = (0, 165, 255)  # Naranja
+                hud_color_global = (0, 165, 255)
                 
                 if self.registro_estado == "preguntando":
                     hud_texto_global = "ASISTENTE: PREGUNTANDO NOMBRE..."
@@ -637,7 +676,7 @@ class SistemaReconocimientoFacial:
                         self.registro_estado = "escuchando"
                         self.registro_timer = ahora
                         self.input_nombre_resultado = None
-                        threading.Thread(target=self.grabar_audio_mci_worker, daemon=True).start()
+                        # El listener de fondo MCI_worker maneja el micrófono
                 
                 elif self.registro_estado == "escuchando":
                     hud_texto_global = "ASISTENTE: ESCUCHANDO NOMBRE... [HABLE AHORA]"
@@ -683,13 +722,13 @@ class SistemaReconocimientoFacial:
                         self.memoria_deteccion.clear()
                         self.registro_estado = None
 
-            # B. Máquina de Estados de Conversación Conversacional Activa (Chat con Llama-3)
+            # B. Máquina de Estados de Conversación Conversacional Activa
             elif self.chat_estado is not None:
-                hud_color_global = (255, 100, 100)  # Azul claro/violeta de conversación
+                hud_color_global = (255, 100, 100)
                 
                 if self.chat_estado == "iniciando_chat":
                     hud_texto_global = f"CHARLANDO CON {self.chat_nombre.upper()}... [INICIANDO]"
-                    if ahora - self.chat_timer > 5.0:  # Termina el saludo
+                    if ahora - self.chat_timer > 5.0:
                         self.chat_estado = "esperando_habla"
                         self.chat_timer = ahora
                 
@@ -697,38 +736,19 @@ class SistemaReconocimientoFacial:
                     hud_texto_global = f"CHARLANDO CON {self.chat_nombre.upper()}... [PREPARANDO]"
                     if ahora - self.chat_timer > 1.2:
                         try:
-                            winsound.Beep(880, 200)  # Tono de escucha
+                            winsound.Beep(880, 200)
                         except:
                             pass
                         self.chat_estado = "escuchando_usuario"
                         self.chat_timer = ahora
-                        self.input_nombre_resultado = None
-                        threading.Thread(target=self.grabar_audio_mci_worker, daemon=True).start()
+                        # El bucle de fondo se encarga de escuchar de forma continua
                 
                 elif self.chat_estado == "escuchando_usuario":
                     hud_texto_global = f"CONVERSANDO: ALEXA ESCUCHA A {self.chat_nombre.upper()}..."
-                    cv2.circle(frame_original, (w_orig - 30, 25), 10, (255, 0, 0), -1)  # Círculo azul de Alexa
+                    cv2.circle(frame_original, (w_orig - 30, 25), 10, (255, 0, 0), -1)
                 
                 elif self.chat_estado == "procesando_usuario":
                     hud_texto_global = "CONVERSANDO: ALEXA PROCESA RESPUESTA..."
-                    if self.input_nombre_resultado is not None:
-                        # Si entendió alguna frase
-                        if self.input_nombre_resultado.strip() != "":
-                            texto_dicho = self.input_nombre_resultado
-                            print(f"[CONVERSACIÓN] {self.chat_nombre}: {texto_dicho}")
-                            self.input_nombre_resultado = None
-                            
-                            # Generar respuesta de Groq en hilo de fondo
-                            self.chat_estado = "procesando_usuario"
-                            threading.Thread(target=self.procesar_charla_worker, args=(texto_dicho,), daemon=True).start()
-                        else:
-                            # Silencio, cerrar charla con saludo amigable
-                            print("[CONVERSACIÓN] Silencio detectado. Cerrando canal.")
-                            encolar_saludo(f"Nos vemos luego, {self.chat_nombre}.")
-                            self.chat_estado = None
-                    else:
-                        # Procesando en hilo en ejecución
-                        pass
 
             # Cartel informativo inicial
             if len(self.nombres_usuarios) == 0 and self.registro_estado is None:
@@ -740,6 +760,8 @@ class SistemaReconocimientoFacial:
                             cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
             
             # --- PROCESAR ROSTROS DETECTADOS ---
+            nombre_actual_en_camara = None
+            
             for (x_peq, y_peq, w_peq, h_peq, es_frontal) in caras_combinadas:
                 x = x_peq * escala
                 y = y_peq * escala
@@ -764,7 +786,7 @@ class SistemaReconocimientoFacial:
                 
                 cara_gris_recortada = gris_opt[y_peq:y_peq+h_peq, x_peq:x_peq+w_peq]
                 
-                # 1. Modo Normal (Escaneo y disparador de charla)
+                # 1. Modo Normal
                 if self.registro_estado is None and self.chat_estado is None:
                     if self.modelo_cargado:
                         try:
@@ -789,16 +811,17 @@ class SistemaReconocimientoFacial:
                                 color = (0, 255, 0)
                                 
                                 self.consecutivos_desconocidos = 0
+                                nombre_actual_en_camara = voto_ganador
                                 
-                                # Disparar bucle conversacional inteligente (cooldown de 90 segundos entre charlas)
-                                ahora_chat = time.time()
-                                if ahora_chat - self.ultimo_chat_voz.get(voto_ganador, 0) > 90.0:
-                                    self.ultimo_chat_voz[voto_ganador] = ahora_chat
-                                    self.iniciar_charla_conversacional(voto_ganador)
+                                # Saludo por voz inicial asíncrono con Cooldown (60 segundos por usuario)
+                                ahora_saludo = time.time()
+                                if ahora_saludo - self.ultimo_chat_voz.get(voto_ganador, 0) > 90.0:
+                                    # Solo saludar si no estamos conversando
+                                    self.ultimo_chat_voz[voto_ganador] = ahora_saludo
+                                    self.encolar_saludo_groq("saludo_conocido", voto_ganador)
                                 
                                 self.guardar_asistencia(voto_ganador, confianza_pct)
                                 
-                                # Captura interactiva selectiva
                                 ahora_t = time.time()
                                 if ahora_t - ultimo_guardado_interactivo > 3.0:
                                     self.auto_capturar_rostro_interaccion(voto_ganador, cara_gris_recortada, w)
@@ -818,7 +841,6 @@ class SistemaReconocimientoFacial:
                         color = (0, 165, 255)
                         self.consecutivos_desconocidos += 1
                     
-                    # DISPARAR REGISTRO AUTÓNOMO
                     if self.consecutivos_desconocidos >= 45:
                         self.iniciar_registro_autonomo()
                 
@@ -832,31 +854,32 @@ class SistemaReconocimientoFacial:
                     if es_mismo_rostro or self.registro_fotos_front == 0:
                         self.procesar_captura_pasiva(cara_gris_recortada, w, es_frontal)
                         
-                # 3. Modo Conversación Activo (Charla con Llama-3)
+                # 3. Modo Conversación Activo
                 elif self.chat_estado is not None:
                     etiqueta = f"CHARLANDO CON {self.chat_nombre.upper()}"
                     subtitulo = f"Alexa: Conexión Activa ({'Frente' if es_frontal else 'Perfil'})"
-                    color = (255, 100, 100)  # Azul/Púrpura
+                    color = (255, 100, 100)
 
-                # Dibujar HUD
                 self.dibujar_hud_futurista(frame_original, x, y, w, h, etiqueta, subtitulo, color)
             
-            # Resetear tracker si no hay caras
+            # Guardar el usuario enfocado actual para que el oyente continuo sepa a quién asociar la charla
+            self.cara_detectada_nombre = nombre_actual_en_camara
+            
             if not cara_detectada_este_frame:
                 self.ultimo_centroide = None
+                self.cara_detectada_nombre = None
                 if self.consecutivos_desconocidos > 0:
                     self.consecutivos_desconocidos -= 1
             
             cv2.imshow("Antigravity Smart Recognition HUD", frame_original)
             
-            # Medir FPS
             t_fin = time.time()
             fps = 1.0 / (t_fin - t_inicio)
             
-            # Salir con 'Q'
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q') or key == ord('Q'):
                 print("\n[SISTEMA] Cerrando aplicación y liberando recursos...")
+                self.stop_listener = True
                 break
                 
         cap.release()
