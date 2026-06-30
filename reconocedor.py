@@ -153,6 +153,16 @@ class SistemaReconocimientoFacial:
         self.last_mic_rms = 0.0
         self.texto_transcrito_pantalla = ""
         self.texto_timer_pantalla = 0.0
+        
+        # --- TRACKING DE ROSTROS Y CLASIFICACIÓN ASÍNCRONA ---
+        self.tracker_rostros = {}
+        self.next_face_id = 1
+        self.predicciones_activas = {}
+        self.ultimo_tiempo_clasificacion = {}
+        self.eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_eye.xml')
+        self.roi_box = None
+        self.contador_frames = 0
+        self.roi_fail_count = 0
         self.ultimo_tiempo_foto = 0.0
 
         # --- ESCUCHA CONTINUA EN SEGUNDO PLANO (RAM - CVE 2.0) ---
@@ -380,17 +390,95 @@ class SistemaReconocimientoFacial:
                     except Exception as e:
                         print(f"[ERROR] No se pudo limpiar la carpeta {d}: {e}")
 
+    def alinear_rostro_ojos(self, rostro_gris):
+        """Detecta los ojos usando Haar Cascades y rota la imagen para alinearlos horizontalmente."""
+        ojos = self.eye_cascade.detectMultiScale(rostro_gris, scaleFactor=1.1, minNeighbors=4, minSize=(15, 15))
+        if len(ojos) >= 2:
+            # Ordenar ojos por posición X para identificar el izquierdo y el derecho
+            ojos = sorted(ojos, key=lambda o: o[0])
+            ojo_izq, ojo_der = ojos[0], ojos[1]
+            
+            # Centro de cada ojo
+            izq_x = ojo_izq[0] + ojo_izq[2] // 2
+            izq_y = ojo_izq[1] + ojo_izq[3] // 2
+            der_x = ojo_der[0] + ojo_der[2] // 2
+            der_y = ojo_der[1] + ojo_der[3] // 2
+            
+            # Calcular ángulo
+            dy = der_y - izq_y
+            dx = der_x - izq_x
+            angulo = np.degrees(np.arctan2(dy, dx))
+            
+            # Centro de rotación
+            centro = ((izq_x + der_x) // 2, (izq_y + der_y) // 2)
+            
+            # Rotar
+            h, w = rostro_gris.shape
+            M = cv2.getRotationMatrix2D(centro, angulo, scale=1.0)
+            rostro_rotado = cv2.warpAffine(rostro_gris, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+            return rostro_rotado
+        return rostro_gris
+
     def preprocesar_rostro_extremo(self, rostro_gris):
         """Aplica un pipeline avanzado para maximizar la nitidez de facciones."""
-        h, w = rostro_gris.shape
+        # 1. Alinear ojos si es posible
+        rostro_alineado = self.alinear_rostro_ojos(rostro_gris)
+        
+        h, w = rostro_alineado.shape
         margin_x = int(w * 0.08)
         margin_y = int(h * 0.08)
         
-        cara_recortada = rostro_gris[margin_y:h-margin_y, margin_x:w-margin_x]
+        cara_recortada = rostro_alineado[margin_y:h-margin_y, margin_x:w-margin_x]
         cara_suave = cv2.bilateralFilter(cara_recortada, d=5, sigmaColor=50, sigmaSpace=50)
         cara_ecualizada = self.clahe.apply(cara_suave)
         
         return cv2.resize(cara_ecualizada, (WIDTH_RESIZE, HEIGHT_RESIZE), interpolation=cv2.INTER_CUBIC)
+
+    def clasificar_rostro_async(self, face_id, cara_gris_crop):
+        """Clasifica un rostro recortado en segundo plano de manera asíncrona para evitar tirones."""
+        if not self.modelo_cargado:
+            return
+            
+        try:
+            # 1. Preprocesar (incluye alineación afín de ojos)
+            cara_gris_norm = self.preprocesar_rostro_extremo(cara_gris_crop)
+            
+            # 2. Inferencia LBPH
+            id_prediccion, distancia = self.recognizer.predict(cara_gris_norm)
+            
+            # 3. Mapear distancia a confianza biométrica
+            if distancia < 40:
+                confianza_pct = 95.0 + (40 - distancia) * 0.125
+            elif distancia < 52:
+                confianza_pct = 80.0 + (52 - distancia) * 1.25
+            elif distancia < 70:
+                confianza_pct = 40.0 + (70 - distancia) * 2.22
+            else:
+                confianza_pct = max(0.0, 40.0 - (distancia - 70) * 2.0)
+                
+            # 4. Asignar nombre según umbral estricto
+            if distancia < 52:
+                nombre = self.nombres_usuarios.get(id_prediccion, "Desconocido")
+            else:
+                nombre = "Desconocido"
+                
+            # 5. Guardar predicción
+            self.predicciones_activas[face_id] = {
+                "nombre": nombre,
+                "confianza": confianza_pct,
+                "distancia": distancia,
+                "tiempo": time.time()
+            }
+            
+            # 6. Auto-aprendizaje incremental en caliente (Online updates)
+            if nombre != "Desconocido" and distancia < 35.0:
+                try:
+                    self.recognizer.update([cara_gris_norm], np.array([id_prediccion]))
+                except:
+                    pass
+                    
+        except Exception as e:
+            print(f"[Async Classification Error] {e}")
 
     def entrenar_modelo(self):
         """Entrena el modelo LBPH usando procesamiento avanzado y thread-safety."""
@@ -909,43 +997,91 @@ class SistemaReconocimientoFacial:
                 self.necesita_recargar_modelo = False
                 print("[HOT-RELOAD] El clasificador facial se ha actualizado de forma segura en caliente.")
             
-            # --- OPTIMIZACIÓN DE FPS ---
-            escala = 2
-            ancho_red = w_orig // escala
-            alto_red = h_orig // escala
-            frame_pequeno = cv2.resize(frame, (ancho_red, alto_red))
-            
-            # Detección profunda usando el modelo DNN ResNet-10 SSD
-            blob = cv2.dnn.blobFromImage(frame_pequeno, 1.0, (300, 300), (104.0, 177.0, 123.0))
-            self.net.setInput(blob)
-            detections = self.net.forward()
-            
+            # --- DETECCIÓN DE ROSTROS OPTIMIZADA CON FRAME SKIPPING Y DYNAMIC RoI ---
+            self.contador_frames += 1
             gris = cv2.cvtColor(frame_pequeno, cv2.COLOR_BGR2GRAY)
-            gris_opt = gris  # Usamos gris normal para recortar; CLAHE se aplicará una sola vez en el preprocesamiento de la cara
+            gris_opt = gris
             
             caras_combinadas = []
             
-            for i in range(detections.shape[2]):
-                confidence = detections[0, 0, i, 2]
-                if confidence > 0.55:  # Umbral de confianza de detección
-                    x_start = int(detections[0, 0, i, 3] * ancho_red)
-                    y_start = int(detections[0, 0, i, 4] * alto_red)
-                    x_end = int(detections[0, 0, i, 5] * ancho_red)
-                    y_end = int(detections[0, 0, i, 6] * alto_red)
+            # Decidir si escaneamos RoI local o frame completo
+            escanear_completo = True
+            if self.roi_box is not None and self.contador_frames % 2 != 0:
+                # Intentar escanear solo el RoI para ahorrar CPU
+                rx1, ry1, rx2, ry2 = self.roi_box
+                # Asegurar límites del RoI
+                rx1 = max(0, rx1)
+                ry1 = max(0, ry1)
+                rx2 = min(ancho_red, rx2)
+                ry2 = min(alto_red, ry2)
+                
+                roi_w = rx2 - rx1
+                roi_h = ry2 - ry1
+                
+                if roi_w > 40 and roi_h > 40:
+                    roi_frame = frame_pequeno[ry1:ry2, rx1:rx2]
+                    # Ejecutar inferencia en el RoI (redimensionado a 200x150 para máxima eficiencia)
+                    roi_small = cv2.resize(roi_frame, (200, 150))
+                    blob = cv2.dnn.blobFromImage(roi_small, 1.0, (150, 150), (104.0, 177.0, 123.0))
+                    self.net.setInput(blob)
+                    detections = self.net.forward()
                     
-                    wf = x_end - x_start
-                    hf = y_end - y_start
-                    
-                    # Forzar límites de imagen
-                    x_start = max(0, x_start)
-                    y_start = max(0, y_start)
-                    wf = min(wf, ancho_red - x_start)
-                    hf = min(hf, alto_red - y_start)
-                    
-                    if wf > 15 and hf > 15:
-                        caras_combinadas.append((x_start, y_start, wf, hf))
+                    for i in range(detections.shape[2]):
+                        confidence = detections[0, 0, i, 2]
+                        if confidence > 0.55:
+                            # Mapear coordenadas locales del RoI a coordenadas de frame_pequeno
+                            x_start = rx1 + int(detections[0, 0, i, 3] * roi_w)
+                            y_start = ry1 + int(detections[0, 0, i, 4] * roi_h)
+                            x_end = rx1 + int(detections[0, 0, i, 5] * roi_w)
+                            y_end = ry1 + int(detections[0, 0, i, 6] * roi_h)
+                            
+                            caras_combinadas.append((x_start, y_start, x_end - x_start, y_end - y_start))
+                            
+                    if len(caras_combinadas) > 0:
+                        escanear_completo = False
+                        self.roi_fail_count = 0
+                    else:
+                        self.roi_fail_count += 1
+                        if self.roi_fail_count > 5:
+                            self.roi_box = None  # Perdimos el rostro, fallback a escaneo completo
             
-            cara_detectada_este_frame = len(caras_combinadas) > 0
+            # Si no hay RoI activo o falló, escaneamos el frame completo cada 3 fotogramas (o si es frame 1)
+            if escanear_completo:
+                if self.contador_frames % 3 == 0 or self.roi_box is None:
+                    # Inferencia en el frame completo redimensionado para velocidad
+                    frame_detect_small = cv2.resize(frame_pequeno, (300, 225))
+                    blob = cv2.dnn.blobFromImage(frame_detect_small, 1.0, (200, 200), (104.0, 177.0, 123.0))
+                    self.net.setInput(blob)
+                    detections = self.net.forward()
+                    
+                    for i in range(detections.shape[2]):
+                        confidence = detections[0, 0, i, 2]
+                        if confidence > 0.55:
+                            x_start = int(detections[0, 0, i, 3] * ancho_red)
+                            y_start = int(detections[0, 0, i, 4] * alto_red)
+                            x_end = int(detections[0, 0, i, 5] * ancho_red)
+                            y_end = int(detections[0, 0, i, 6] * alto_red)
+                            
+                            caras_combinadas.append((x_start, y_start, x_end - x_start, y_end - y_start))
+                else:
+                    # En frames intermedios sin escaneo, reusamos el último RoI box como rostro activo
+                    if self.roi_box is not None:
+                        rx1, ry1, rx2, ry2 = self.roi_box
+                        caras_combinadas.append((rx1, ry1, rx2 - rx1, ry2 - ry1))
+                        
+            # Actualizar dinámicamente la Región de Interés (RoI) en caliente
+            if len(caras_combinadas) > 0:
+                x_c, y_c, w_c, h_c = caras_combinadas[0]
+                margen_w = int(w_c * 0.3)
+                margen_h = int(h_c * 0.3)
+                self.roi_box = [
+                    x_c - margen_w,
+                    y_c - margen_h,
+                    x_c + w_c + margen_w,
+                    y_c + h_c + margen_h
+                ]
+            else:
+                self.roi_box = None
             
             # --- MÁQUINA DE ESTADOS GLOBAL ---
             ahora = time.time()
@@ -1080,6 +1216,9 @@ class SistemaReconocimientoFacial:
             # --- PROCESAR ROSTROS DETECTADOS ---
             nombre_actual_en_camara = None
             
+            # Limpiar entradas antiguas del tracker (inactivas por más de 2 segundos)
+            self.tracker_rostros = {fid: val for fid, val in self.tracker_rostros.items() if ahora - val[2] < 2.0}
+            
             for (x_peq, y_peq, w_peq, h_peq) in caras_combinadas:
                 x = x_peq * escala
                 y = y_peq * escala
@@ -1089,19 +1228,35 @@ class SistemaReconocimientoFacial:
                 cx = x + w // 2
                 cy = y + h // 2
                 
-                es_mismo_rostro = False
-                if self.ultimo_centroide is not None:
-                    dist_centroides = np.sqrt((cx - self.ultimo_centroide[0])**2 + (cy - self.ultimo_centroide[1])**2)
-                    if dist_centroides < 85:
-                        es_mismo_rostro = True
-                
-                self.ultimo_centroide = (cx, cy)
+                # Asignar un ID persistente a este rostro por distancia de centroides
+                face_id = None
+                menor_dist = 999.0
+                for fid, (fx, fy, ft) in self.tracker_rostros.items():
+                    dist = np.sqrt((cx - fx)**2 + (cy - fy)**2)
+                    if dist < 90.0 and dist < menor_dist:
+                        face_id = fid
+                        menor_dist = dist
+                        
+                if face_id is None:
+                    face_id = self.next_face_id
+                    self.next_face_id += 1
+                    
+                # Registrar posición actual en el tracker
+                self.tracker_rostros[face_id] = (cx, cy, ahora)
                 
                 etiqueta = "Analizando..."
                 subtitulo = "Estimando pose..."
                 color = (0, 255, 255)
                 
                 cara_gris_recortada = gris_opt[y_peq:y_peq+h_peq, x_peq:x_peq+w_peq]
+                
+                # FQA: Filtro de desenfoque (Laplacian Variance)
+                var_nitidez = 999.0
+                if cara_gris_recortada.size > 0:
+                    try:
+                        var_nitidez = cv2.Laplacian(cara_gris_recortada, cv2.CV_64F).var()
+                    except:
+                        pass
                 
                 # 1. Modo Registro Activo
                 if self.registro_estado is not None:
@@ -1120,40 +1275,40 @@ class SistemaReconocimientoFacial:
                         subtitulo = f"Capturas: {self.registro_fotos_guardadas}/15"
                     color = (0, 165, 255)
                     
-                    if es_mismo_rostro or self.registro_fotos_guardadas == 0:
-                        self.procesar_captura_pasiva(cara_gris_recortada)
+                    self.procesar_captura_pasiva(cara_gris_recortada)
                         
-                # 2. Modo Normal / Conversación (Preprocesar y clasificar siempre)
+                # 2. Modo Normal / Conversación (Preprocesar y clasificar de forma asíncrona)
                 else:
-                    nombre_detectado = "Desconocido"
-                    confianza_pct = 0.0
-                    distancia = 999.0
+                    # FQA: Si está muy borroso, omitir predicción para ahorrar CPU y evitar falsos positivos
+                    if var_nitidez < 70.0:
+                        etiqueta = "DESCARTADO"
+                        subtitulo = f"Borroso (FQA): {var_nitidez:.1f}"
+                        color = (0, 165, 255)
+                        self.dibujar_hud_futurista(frame_original, x, y, w, h, etiqueta, subtitulo, color)
+                        continue
+                        
+                    # Lanzar clasificación asíncrona si ha pasado el intervalo (4 veces por segundo por rostro)
+                    ultimo_t = self.ultimo_tiempo_clasificacion.get(face_id, 0.0)
+                    if ahora - ultimo_t > 0.25:
+                        self.ultimo_tiempo_clasificacion[face_id] = ahora
+                        threading.Thread(
+                            target=self.clasificar_rostro_async,
+                            args=(face_id, cara_gris_recortada.copy()),
+                            daemon=True
+                        ).start()
+                        
+                    # Leer predicción asíncrona
+                    pred = self.predicciones_activas.get(face_id, {
+                        "nombre": "Identificando...",
+                        "confianza": 0.0,
+                        "distancia": 999.0
+                    })
                     
-                    if self.modelo_cargado:
-                        try:
-                            cara_gris_norm = self.preprocesar_rostro_extremo(cara_gris_recortada)
-                            id_prediccion, distancia = self.recognizer.predict(cara_gris_norm)
-                            
-                            # Mapear la distancia matemática de LBPH a una escala de confianza biométrica intuitiva (0% - 100%)
-                            if distancia < 40:
-                                confianza_pct = 95.0 + (40 - distancia) * 0.125
-                            elif distancia < 52:
-                                confianza_pct = 80.0 + (52 - distancia) * 1.25
-                            elif distancia < 70:
-                                confianza_pct = 40.0 + (70 - distancia) * 2.22
-                            else:
-                                confianza_pct = max(0.0, 40.0 - (distancia - 70) * 2.0)
-                                
-                            # Umbral estricto basado en la distancia del histograma LBPH (distancia < 52 es un match seguro)
-                            if distancia < 52:
-                                nombre_detectado = self.nombres_usuarios.get(id_prediccion, "Desconocido")
-                        except Exception as e:
-                            print(f"[IA Predict Error] {e}")
-                            
-                    # Agregar a memoria de estabilización
-                    self.memoria_deteccion.append(nombre_detectado)
+                    nombre_detectado = pred["nombre"]
+                    confianza_pct = pred["confianza"]
+                    distancia = pred["distancia"]
                     
-                    if nombre_detectado != "Desconocido":
+                    if nombre_detectado != "Identificando..." and nombre_detectado != "Desconocido":
                         # Si es con el que está charlando actualmente
                         if self.chat_estado is not None and nombre_detectado == self.chat_nombre:
                             etiqueta = f"HABLANDO: {nombre_detectado.upper()}"
@@ -1164,11 +1319,15 @@ class SistemaReconocimientoFacial:
                         subtitulo = f"Match: {confianza_pct:.1f}%"
                         self.consecutivos_desconocidos = 0
                         nombre_actual_en_camara = nombre_detectado
-                    else:
+                    elif nombre_detectado == "Desconocido":
                         etiqueta = "DESCONOCIDO"
                         subtitulo = f"Match: {confianza_pct:.1f}%"
                         color = (0, 0, 255)
                         self.consecutivos_desconocidos += 1
+                    else:
+                        etiqueta = "IDENTIFICANDO..."
+                        subtitulo = "Espere..."
+                        color = (0, 255, 255)
                         
                     # Procesar lógica conversacional y auto-aprendizaje sólo si es modo normal (sin registro)
                     if self.registro_estado is None:
@@ -1200,8 +1359,7 @@ class SistemaReconocimientoFacial:
             
             self.cara_detectada_nombre = nombre_actual_en_camara
             
-            if not cara_detectada_este_frame:
-                self.ultimo_centroide = None
+            if len(caras_combinadas) == 0:
                 self.cara_detectada_nombre = None
                 if self.consecutivos_desconocidos > 0:
                     self.consecutivos_desconocidos -= 1
