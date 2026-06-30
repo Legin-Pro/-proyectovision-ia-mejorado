@@ -137,6 +137,9 @@ class SistemaReconocimientoFacial:
         self.fotos_auto_guardadas = 0
         self.ultimo_registro_asistencia = {}
         self.ultimo_chat_voz = {}
+        self.last_mic_rms = 0.0
+        self.texto_transcrito_pantalla = ""
+        self.texto_timer_pantalla = 0.0
 
         # --- ESCUCHA CONTINUA EN SEGUNDO PLANO (RAM - CVE 2.0) ---
         self.umbral_silencio = 0.025  # Umbral base por defecto (calibrado en bucle_escucha_continua)
@@ -498,6 +501,7 @@ class SistemaReconocimientoFacial:
                     try:
                         data, overflow = stream.read(chunk_size)
                         rms = np.sqrt(np.mean(data**2))
+                        self.last_mic_rms = float(rms)
                         
                         if rms > self.umbral_silencio:
                             print(f"[VAD] Habla detectada. Grabando...")
@@ -512,6 +516,8 @@ class SistemaReconocimientoFacial:
                                 audio_chunks.append(chunk)
                                 
                                 c_rms = np.sqrt(np.mean(chunk**2))
+                                self.last_mic_rms = float(c_rms)
+                                
                                 if c_rms > self.umbral_silencio:
                                     silencio_consecutivo = 0
                                 else:
@@ -529,6 +535,8 @@ class SistemaReconocimientoFacial:
                             texto_entendido = self.transcribir_groq_whisper(wav_bytes)
                             if texto_entendido:
                                 print(f"[Whisper Transcripción] Entendido: '{texto_entendido}'")
+                                self.texto_transcrito_pantalla = texto_entendido
+                                self.texto_timer_pantalla = time.time()
                                 self.procesar_voz_entrada_pasiva(texto_entendido)
                     except Exception as e:
                         print(f"[Audio Loop Inner Error] {e}")
@@ -1006,6 +1014,24 @@ class SistemaReconocimientoFacial:
             cv2.rectangle(frame_original, (0, 0), (w_orig, 40), (15, 15, 15), -1)
             cv2.putText(frame_original, hud_texto_global, (15, 25),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, hud_color_global, 1, cv2.LINE_AA)
+            
+            # --- DIBUJAR NIVEL DE MICRÓFONO (VAD LIVE METER) ---
+            mic_w = int(min(self.last_mic_rms * 500.0, 100.0))
+            meter_x = w_orig - 120
+            cv2.rectangle(frame_original, (meter_x, 15), (meter_x + 100, 25), (40, 40, 40), -1)
+            color_barra = (0, 255, 255) if self.last_mic_rms > self.umbral_silencio else (120, 120, 120)
+            cv2.rectangle(frame_original, (meter_x, 15), (meter_x + mic_w, 25), color_barra, -1)
+            cv2.putText(frame_original, f"MIC (Thresh: {self.umbral_silencio:.3f})", (meter_x - 170, 23),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1, cv2.LINE_AA)
+            
+            # --- DIBUJAR SUBTÍTULOS DE TRANSCRIPCIÓN (VOZ A TEXTO EN PANTALLA) ---
+            if self.texto_transcrito_pantalla and (time.time() - self.texto_timer_pantalla < 5.0):
+                sub_y = h_orig - 45
+                cv2.rectangle(frame_original, (10, sub_y - 20), (w_orig - 10, sub_y + 20), (15, 15, 15), -1)
+                cv2.rectangle(frame_original, (10, sub_y - 20), (w_orig - 10, sub_y + 20), (100, 100, 100), 1)
+                texto_sub = f"ESCUCHADO: {self.texto_transcrito_pantalla.upper()}"
+                cv2.putText(frame_original, texto_sub, (25, sub_y + 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 255), 1, cv2.LINE_AA)
             
             cv2.imshow("Antigravity Smart Recognition HUD", frame_original)
             
