@@ -59,7 +59,7 @@ def hablar_worker():
             with voz_lock:
                 try:
                     asistente_hablando = True
-                    voice.Speak(texto, 0)  # Síncrono dentro del hilo de voz
+                    voice.Speak(texto, 0)
                     asistente_hablando = False
                 except Exception as e:
                     print(f"[Voz Error] Error de reproducción SAPI5: {e}")
@@ -91,24 +91,31 @@ class SistemaReconocimientoFacial:
         self.face_cascade = cv2.CascadeClassifier(HAAR_FRONTAL_PATH)
         self.profile_cascade = cv2.CascadeClassifier(HAAR_PROFILE_PATH)
         
-        # Inicializar el reconocedor LBPH de OpenCV
-        self.recognizer = cv2.face.LBPHFaceRecognizer_create()
+        # Ecualizador de contraste adaptable (CLAHE) para normalización de iluminación
+        self.clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        
+        # Inicializar el reconocedor LBPH de OpenCV con hiperparámetros optimizados
+        self.recognizer = cv2.face.LBPHFaceRecognizer_create(
+            radius=2,
+            neighbors=12,
+            grid_x=10,
+            grid_y=10
+        )
+        
         self.modelo_cargado = False
+        self.necesita_recargar_modelo = False  # Flag de control para recarga segura de modelo
         self.nombres_usuarios = {}
         self.cargar_modelo()
         
         # Leer clave API de Groq del archivo local .env
         self.groq_key = self.cargar_groq_key()
         
-        # Ecualizador de contraste adaptable (CLAHE) para optimizar detección lejana
-        self.clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        
         # Historial de detecciones para estabilizar predicciones
         self.memoria_deteccion = deque(maxlen=7)
-        self.cara_detectada_nombre = None  # Nombre de la persona actualmente en cámara
+        self.cara_detectada_nombre = None
         
         # --- SEGUIDOR POR CENTROIDES (ID TEMPORAL) ---
-        self.ultimo_centroide = None  # (cx, cy)
+        self.ultimo_centroide = None
         
         # --- MÁQUINA DE ESTADOS PARA EL REGISTRO DE VOZ (ALEXA STYLE) ---
         self.registro_estado = None
@@ -123,15 +130,13 @@ class SistemaReconocimientoFacial:
         self.chat_estado = None
         self.chat_nombre = ""
         self.chat_timer = 0
-        self.historial_conversacion = deque(maxlen=6)
+        self.historial_conversacion = deque(maxlen=16)
         
-        # Variables de control de hilos
+        # Variables de control
         self.input_nombre_resultado = None
         self.consecutivos_desconocidos = 0
         self.fotos_auto_guardadas = 0
         self.ultimo_registro_asistencia = {}
-        
-        # Cooldown de chat por voz por usuario (60 segundos)
         self.ultimo_chat_voz = {}
 
         # --- ESCUCHA CONTINUA EN SEGUNDO PLANO (SIEMPRE ESCUCHANDO) ---
@@ -154,18 +159,23 @@ class SistemaReconocimientoFacial:
         return None
 
     def generar_frase_llm(self, tipo, nombre=None, texto_conversacion=None):
-        """Genera una frase contextual humanizada y con personalidad usando Groq Llama-3."""
+        """Genera una frase contextual humanizada, con personalidad e información del entorno usando Llama-3."""
         if not self.groq_key:
             if tipo == "chat":
                 return "No tengo conexión a internet para charlar en este momento."
             return self.generar_frase_local(tipo, nombre)
             
-        # --- PERSONALIDAD DE LA IA: Carismática, ingeniosa, con toques de humor e inteligente ---
+        hora_actual = time.strftime("%H:%M")
+        fecha_actual = time.strftime("%Y-%m-%d")
+        total_usuarios = len(self.nombres_usuarios)
+        
         persona = nombre if nombre else "un extraño"
         system_content = (
-            f"Eres Alexa, una inteligencia artificial de visión muy ingeniosa, carismática y simpática. "
-            f"Interactúas con {persona}. Responde SIEMPRE en español, con un tono muy amigable, ingenioso, "
-            f"divertido y breve (máximo 15 palabras). Evita respuestas aburridas o predecibles. No uses markdown, asteriscos ni comillas."
+            f"Eres Alexa, una inteligencia artificial de visión muy ingeniosa, carismática y simpática en español. "
+            f"Interactúas con {persona}. Datos actuales del entorno: Hora local: {hora_actual}, Fecha: {fecha_actual}, "
+            f"Usuarios registrados en el sistema: {total_usuarios}. "
+            f"Responde SIEMPRE en español, de forma muy amigable, ingeniosa, divertida y extremadamente breve (máximo 15 palabras). "
+            f"Evita respuestas aburridas o predecibles. No uses markdown, asteriscos ni comillas."
         )
         
         if tipo == "chat" and texto_conversacion:
@@ -174,7 +184,7 @@ class SistemaReconocimientoFacial:
         else:
             if tipo == "saludo_conocido":
                 prompt = (
-                    f"Genera un saludo ocurrente y casual (máximo 12 palabras) para {nombre}. "
+                    f"Genera un saludo ocurrente y muy corto (máximo 12 palabras) en español para {nombre}. "
                     f"Ej: '¡Vaya, al fin apareces {nombre}! Estaba aburriéndome de ver la pared.'"
                 )
             elif tipo == "saludo_nuevo":
@@ -227,17 +237,17 @@ class SistemaReconocimientoFacial:
     def generar_frase_local(self, tipo, nombre=None):
         """Generador local aleatorio de reserva."""
         if tipo == "saludo_conocido":
-            return random.choice(FRASES_SALUDOS_CONOCIDOS).replace("[nombre]", nombre)
+            return f"Hola {nombre}, bienvenido de nuevo al sistema."
         elif tipo == "saludo_nuevo":
-            return random.choice(FRASES_SALUDOS_NUEVOS)
+            return "Hola, no te tengo en mi base de datos. ¿Cómo te llamas?"
         elif tipo == "durante_registro":
-            return random.choice(FRASES_DURANTE_REGISTRO).replace("[nombre]", nombre)
+            return f"Perfecto {nombre}, quédate ahí quieto un momento mientras te analizo."
         elif tipo == "registro_completo":
-            return random.choice(FRASES_REGISTRO_COMPLETO).replace("[nombre]", nombre)
+            return f"Registro completado. Un placer conocerte, {nombre}."
         return ""
 
     def cargar_modelo(self):
-        """Carga el clasificador LBPH y el mapeo de IDs de usuarios."""
+        """Carga de forma segura el clasificador LBPH y actualiza el mapeo de nombres."""
         if os.path.exists(TRAINER_FILE):
             try:
                 self.recognizer.read(TRAINER_FILE)
@@ -253,20 +263,27 @@ class SistemaReconocimientoFacial:
         self.actualizar_mapeo_nombres()
 
     def actualizar_mapeo_nombres(self):
-        """Asigna un ID numérico a cada carpeta de usuario."""
+        """Asigna un ID numérico a cada carpeta de usuario de forma alfabética."""
         if not os.path.exists(DATASET_DIR):
             return
         subdirs = sorted([d for d in os.listdir(DATASET_DIR) if os.path.isdir(os.path.join(DATASET_DIR, d))])
         self.nombres_usuarios = {i: name for i, name in enumerate(subdirs)}
 
     def entrenar_modelo(self):
-        """Entrena el modelo LBPH de OpenCV con las imágenes en dataset/."""
+        """
+        Entrena el modelo LBPH usando un reconocedor temporal para evitar
+        conflictos de hilos (Thread-safe) con el bucle de predicción principal.
+        """
         print("[IA ENTRENAMIENTO] Iniciando entrenamiento en segundo plano...")
         rostros = []
         ids = []
         
-        self.actualizar_mapeo_nombres()
-        nombre_a_id = {v: k for k, v in self.nombres_usuarios.items()}
+        # Mapeo temporal local para la duración del entrenamiento
+        if not os.path.exists(DATASET_DIR):
+            return False
+        subdirs = sorted([d for d in os.listdir(DATASET_DIR) if os.path.isdir(os.path.join(DATASET_DIR, d))])
+        temp_nombres_usuarios = {i: name for i, name in enumerate(subdirs)}
+        nombre_a_id = {v: k for k, v in temp_nombres_usuarios.items()}
         
         for nombre_usuario in os.listdir(DATASET_DIR):
             ruta_usuario = os.path.join(DATASET_DIR, nombre_usuario)
@@ -282,22 +299,32 @@ class SistemaReconocimientoFacial:
                     
                 img_gris = cv2.imread(ruta_imagen, cv2.IMREAD_GRAYSCALE)
                 if img_gris is not None:
+                    # Normalización de iluminación local CLAHE
+                    img_gris = self.clahe.apply(img_gris)
                     img_gris = cv2.resize(img_gris, (WIDTH_RESIZE, HEIGHT_RESIZE), interpolation=cv2.INTER_CUBIC)
                     rostros.append(img_gris)
                     ids.append(usuario_id)
         
         if len(rostros) == 0:
-            self.modelo_cargado = False
             return False
             
         try:
-            self.recognizer.train(rostros, np.array(ids))
-            self.recognizer.write(TRAINER_FILE)
-            self.modelo_cargado = True
-            print("[IA ENTRENAMIENTO] Modelo actualizado y cargado con éxito.")
+            # Crear reconocedor local aislado para entrenar
+            temp_recognizer = cv2.face.LBPHFaceRecognizer_create(
+                radius=2,
+                neighbors=12,
+                grid_x=10,
+                grid_y=10
+            )
+            temp_recognizer.train(rostros, np.array(ids))
+            temp_recognizer.write(TRAINER_FILE)
+            
+            # Notificar al hilo principal para que cargue el archivo de forma segura
+            self.necesita_recargar_modelo = True
+            print("[IA ENTRENAMIENTO] Entrenamiento finalizado. Pendiente de recarga segura.")
             return True
         except Exception as e:
-            print(f"[IA ERROR] Error al entrenar: {e}")
+            print(f"[IA ERROR] Error al entrenar en segundo plano: {e}")
             return False
 
     def entrenar_en_segundo_plano(self):
@@ -306,30 +333,22 @@ class SistemaReconocimientoFacial:
         hilo.start()
 
     def bucle_escucha_continua(self):
-        """
-        Bucle infinito en segundo plano (Siempre escuchando).
-        Escucha y procesa audio de forma asíncrona sin bloquear la cámara.
-        Evita el feedback acústico pausando la grabación cuando el asistente habla.
-        """
+        """Bucle infinito en segundo plano (Siempre escuchando)."""
         winmm = ctypes.windll.winmm
         r = sr.Recognizer()
         wav_path = "temp_background_mic.wav"
         
-        # Pausa inicial para estabilizar cámara
         time.sleep(2.0)
         
         while not self.stop_listener:
-            # 1. EVITAR FEEDBACK ACÚSTICO: Si Alexa está hablando físicamente, no grabar.
             if asistente_hablando:
                 time.sleep(0.5)
                 continue
                 
-            # 2. Si el sistema está registrando un nombre por popup, pausar escucha continua
             if self.registro_estado == "esperando_popup":
                 time.sleep(0.5)
                 continue
                 
-            # 3. Grabar fragmento de audio de 3.5 segundos en el hilo
             winmm.mciSendStringW("close recsound", None, 0, 0)
             winmm.mciSendStringW("open new type waveaudio alias recsound", None, 0, 0)
             winmm.mciSendStringW("set recsound time format ms", None, 0, 0)
@@ -339,15 +358,12 @@ class SistemaReconocimientoFacial:
             
             winmm.mciSendStringW("record recsound", None, 0, 0)
             
-            # Grabar por 3.5 segundos
             time.sleep(3.5)
             
-            # Detener y guardar
             winmm.mciSendStringW("stop recsound", None, 0, 0)
             winmm.mciSendStringW(f"save recsound {wav_path}", None, 0, 0)
             winmm.mciSendStringW("close recsound", None, 0, 0)
             
-            # Si Alexa empezó a hablar justo al terminar la grabación, descartar para evitar feedback
             if asistente_hablando:
                 try:
                     os.remove(wav_path)
@@ -355,7 +371,6 @@ class SistemaReconocimientoFacial:
                     pass
                 continue
                 
-            # 4. Transcribir el audio en segundo plano
             texto_entendido = ""
             if os.path.exists(wav_path):
                 try:
@@ -371,13 +386,11 @@ class SistemaReconocimientoFacial:
                     except:
                         pass
             
-            # 5. Procesar lo escuchado según el estado actual
             if texto_entendido:
                 self.procesar_voz_entrada_pasiva(texto_entendido)
 
     def procesar_voz_entrada_pasiva(self, texto):
         """Procesa el texto capturado por la escucha continua en segundo plano."""
-        # A. Si estamos en modo Registro Autónomo esperando el Nombre por micrófono
         if self.registro_estado == "escuchando":
             palabras = texto.strip().split()
             nombre = None
@@ -389,18 +402,13 @@ class SistemaReconocimientoFacial:
             self.input_nombre_resultado = nombre
             self.registro_estado = "procesando_voz"
             
-        # B. Si estamos en medio de un chat activo
         elif self.chat_estado is not None:
-            # Procesar chat de forma asíncrona
             self.chat_estado = "procesando_usuario"
             threading.Thread(target=self.procesar_charla_worker, args=(texto,), daemon=True).start()
             
-        # C. Si estamos en modo escaneo normal, pero hay una persona frente a la cámara y habla
         elif self.chat_estado is None and self.registro_estado is None:
-            # Si hay una persona conocida detectada recientemente
             if self.cara_detectada_nombre and self.cara_detectada_nombre != "Desconocido":
                 nombre = self.cara_detectada_nombre
-                # Iniciar la conversación usando el texto dicho como primera intervención
                 self.chat_nombre = nombre
                 self.chat_estado = "procesando_usuario"
                 self.historial_conversacion.clear()
@@ -408,7 +416,6 @@ class SistemaReconocimientoFacial:
                 print(f"[CONVERSACIÓN INICIADA PASIVAMENTE] {nombre} dijo: '{texto}'")
                 self.ultimo_chat_voz[nombre] = time.time()
                 
-                # Lanzar respuesta
                 threading.Thread(target=self.procesar_charla_worker, args=(texto,), daemon=True).start()
 
     def solicitar_nombre_popup_worker(self):
@@ -459,7 +466,6 @@ class SistemaReconocimientoFacial:
         if cerrar_conversacion:
             self.chat_estado = None
         else:
-            # Volver a escuchar de forma pasiva
             self.chat_timer = time.time()
             self.chat_estado = "esperando_habla"
 
@@ -486,10 +492,7 @@ class SistemaReconocimientoFacial:
             print(f"[CSV ERROR] No se pudo guardar en CSV: {e}")
 
     def auto_capturar_rostro_interaccion(self, nombre, rostro_gris, w_face):
-        """
-        Muestreo selectivo interactivo para asimilar variaciones de distancia.
-        Máximo 5 fotos por categoría (Cerca/Medio/Lejos) para evitar saturar el disco.
-        """
+        """Muestreo selectivo interactivo para asimilar variaciones de distancia."""
         ruta_usuario = os.path.join(DATASET_DIR, nombre)
         if not os.path.exists(ruta_usuario):
             return
@@ -505,7 +508,9 @@ class SistemaReconocimientoFacial:
         if len(archivos_categoria) >= 5:
             return
             
-        rostro_red = cv2.resize(rostro_gris, (WIDTH_RESIZE, HEIGHT_RESIZE), interpolation=cv2.INTER_CUBIC)
+        rostro_gris_opt = self.clahe.apply(rostro_gris)
+        rostro_red = cv2.resize(rostro_gris_opt, (WIDTH_RESIZE, HEIGHT_RESIZE), interpolation=cv2.INTER_CUBIC)
+        
         index = len(archivos_categoria)
         archivo_nombre = f"{nombre}_auto_{distancia_tag}_{index}.jpg"
         cv2.imwrite(os.path.join(ruta_usuario, archivo_nombre), rostro_red)
@@ -518,12 +523,13 @@ class SistemaReconocimientoFacial:
             self.entrenar_en_segundo_plano()
 
     def procesar_captura_pasiva(self, rostro_gris, w_face, es_frontal):
-        """Guarda silenciosa e implícitamente las caras en diferentes poses y distancias."""
+        """Guarda silenciosa e implícitamente las caras aplicando normalización CLAHE local."""
         ruta_usuario = os.path.join(DATASET_DIR, self.registro_nombre)
         if not os.path.exists(ruta_usuario):
             os.makedirs(ruta_usuario)
             
-        rostro_red = cv2.resize(rostro_gris, (WIDTH_RESIZE, HEIGHT_RESIZE), interpolation=cv2.INTER_CUBIC)
+        rostro_opt = self.clahe.apply(rostro_gris)
+        rostro_red = cv2.resize(rostro_opt, (WIDTH_RESIZE, HEIGHT_RESIZE), interpolation=cv2.INTER_CUBIC)
         
         if w_face >= 120:
             dist_tag = "cerca"
@@ -603,11 +609,10 @@ class SistemaReconocimientoFacial:
         fps = 0
         ultimo_guardado_interactivo = 0
         
-        print("\nSISTEMA INTELIGENTE DE RECONOCIMIENTO FACIAL INICIADO.")
+        print("\nSISTEMA INTELIGENTE DE RECONOCIMIENTO FACIAL INICIADO (PRECISIÓN EXTREMA Y MULTIUSUARIOS).")
         print("Modo Conversacional y Autónomo Activo:")
-        print("  - Voz funcional habilitada en hilos mediante CoInitialize y win32com.")
-        print("  - Diálogos inteligentes bidireccionales con Groq Llama-3.")
-        print("  - Grabación de micrófono a 16kHz Mono optimizada para alta precisión.")
+        print("  - Registro dinámico multiusuario ilimitado e instantáneo.")
+        print("  - Recarga segura de modelo (Thread-safe) en tiempo de ejecución sin interrupciones.")
         print("  - Presione 'Q' en la pantalla del video para salir.")
         print("-" * 60)
         
@@ -621,6 +626,12 @@ class SistemaReconocimientoFacial:
                 
             frame_original = frame.copy()
             h_orig, w_orig = frame.shape[:2]
+            
+            # --- RECARGA DE MODELO SEGURA (THREAD-SAFE) EN CALIENTE ---
+            if self.necesita_recargar_modelo:
+                self.cargar_modelo()
+                self.necesita_recargar_modelo = False
+                print("[HOT-RELOAD] El clasificador facial se ha actualizado de forma segura en caliente.")
             
             # --- OPTIMIZACIÓN DE FPS (Procesar a 1/2 resolución) ---
             escala = 2
@@ -676,7 +687,6 @@ class SistemaReconocimientoFacial:
                         self.registro_estado = "escuchando"
                         self.registro_timer = ahora
                         self.input_nombre_resultado = None
-                        # El listener de fondo MCI_worker maneja el micrófono
                 
                 elif self.registro_estado == "escuchando":
                     hud_texto_global = "ASISTENTE: ESCUCHANDO NOMBRE... [HABLE AHORA]"
@@ -741,7 +751,6 @@ class SistemaReconocimientoFacial:
                             pass
                         self.chat_estado = "escuchando_usuario"
                         self.chat_timer = ahora
-                        # El bucle de fondo se encarga de escuchar de forma continua
                 
                 elif self.chat_estado == "escuchando_usuario":
                     hud_texto_global = f"CONVERSANDO: ALEXA ESCUCHA A {self.chat_nombre.upper()}..."
@@ -771,7 +780,6 @@ class SistemaReconocimientoFacial:
                 cx = x + w // 2
                 cy = y + h // 2
                 
-                # Seguimiento por centroides
                 es_mismo_rostro = False
                 if self.ultimo_centroide is not None:
                     dist_centroides = np.sqrt((cx - self.ultimo_centroide[0])**2 + (cy - self.ultimo_centroide[1])**2)
@@ -790,7 +798,10 @@ class SistemaReconocimientoFacial:
                 if self.registro_estado is None and self.chat_estado is None:
                     if self.modelo_cargado:
                         try:
-                            cara_gris_norm = cv2.resize(cara_gris_recortada, (WIDTH_RESIZE, HEIGHT_RESIZE), interpolation=cv2.INTER_CUBIC)
+                            # Normalización de contraste local CLAHE
+                            cara_gris_norm = self.clahe.apply(cara_gris_recortada)
+                            cara_gris_norm = cv2.resize(cara_gris_norm, (WIDTH_RESIZE, HEIGHT_RESIZE), interpolation=cv2.INTER_CUBIC)
+                            
                             id_prediccion, distancia = self.recognizer.predict(cara_gris_norm)
                             confianza_pct = max(0, 100 - distancia)
                             
@@ -813,12 +824,10 @@ class SistemaReconocimientoFacial:
                                 self.consecutivos_desconocidos = 0
                                 nombre_actual_en_camara = voto_ganador
                                 
-                                # Saludo por voz inicial asíncrono con Cooldown (60 segundos por usuario)
-                                ahora_saludo = time.time()
-                                if ahora_saludo - self.ultimo_chat_voz.get(voto_ganador, 0) > 90.0:
-                                    # Solo saludar si no estamos conversando
-                                    self.ultimo_chat_voz[voto_ganador] = ahora_saludo
-                                    self.encolar_saludo_groq("saludo_conocido", voto_ganador)
+                                ahora_chat = time.time()
+                                if ahora_chat - self.ultimo_chat_voz.get(voto_ganador, 0) > 90.0:
+                                    self.ultimo_chat_voz[voto_ganador] = ahora_chat
+                                    self.iniciar_charla_conversacional(voto_ganador)
                                 
                                 self.guardar_asistencia(voto_ganador, confianza_pct)
                                 
@@ -862,7 +871,6 @@ class SistemaReconocimientoFacial:
 
                 self.dibujar_hud_futurista(frame_original, x, y, w, h, etiqueta, subtitulo, color)
             
-            # Guardar el usuario enfocado actual para que el oyente continuo sepa a quién asociar la charla
             self.cara_detectada_nombre = nombre_actual_en_camara
             
             if not cara_detectada_este_frame:
