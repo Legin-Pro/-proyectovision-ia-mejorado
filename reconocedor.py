@@ -403,7 +403,8 @@ class SistemaReconocimientoFacial:
                 grid_y=8
             )
             temp_recognizer.train(rostros, np.array(ids))
-            temp_recognizer.write(TRAINER_FILE)
+            temp_recognizer.write(TRAINER_FILE + ".tmp")
+            os.replace(TRAINER_FILE + ".tmp", TRAINER_FILE)
             
             self.necesita_recargar_modelo = True
             print("[IA ENTRENAMIENTO] Entrenamiento finalizado. Pendiente de recarga segura.")
@@ -576,26 +577,60 @@ class SistemaReconocimientoFacial:
             
         print(f"[VOZ A TEXTO] Transcripción recibida: '{texto_limpio}'")
         
+        # A. Si ya está escuchando activamente el nombre del usuario para el registro
         if self.registro_estado == "escuchando":
             palabras = texto_limpio.split()
             nombre = None
             if palabras:
-                if len(palabras) >= 3 and palabras[0].lower() in ["me", "mi"] and palabras[1].lower() in ["llamo", "nombre"]:
-                    nombre = palabras[2]
-                else:
+                # Comprobar si dice "me llamo X" o "mi nombre es X"
+                for idx, pal in enumerate(palabras):
+                    if pal.lower() in ["llamo", "es"] and idx + 1 < len(palabras):
+                        nombre = palabras[idx+1]
+                        break
+                if not nombre:
                     nombre = palabras[0]
             if nombre:
                 nombre = ''.join(c for c in nombre if c.isalnum()).capitalize()
             self.input_nombre_resultado = nombre
             self.registro_estado = "procesando_voz"
             
+        # B. Si el chat conversacional ya está activo
         elif self.chat_estado is not None:
             print("[FLUJO IA] Enviando texto a la conversación activa con Groq...")
             self.chat_estado = "procesando_usuario"
             threading.Thread(target=self.procesar_charla_worker, args=(texto_limpio,), daemon=True).start()
             
+        # C. Si el sistema está en reposo (buscando rostros)
         elif self.chat_estado is None and self.registro_estado is None:
-            # Canalizar conversación independientemente de si hay rostro detectado o conocido
+            texto_lower = texto_limpio.lower()
+            
+            # 1. Comando de registro directo: "Me llamo Miguel" o "Mi nombre es Maria"
+            if "me llamo " in texto_lower or "mi nombre es " in texto_lower:
+                palabras = texto_limpio.split()
+                nombre = None
+                for idx, pal in enumerate(palabras):
+                    if pal.lower() in ["llamo", "es"] and idx + 1 < len(palabras):
+                        nombre = palabras[idx+1]
+                        break
+                if nombre:
+                    nombre = ''.join(c for c in nombre if c.isalnum()).capitalize()
+                    # Salir si el nombre es demasiado genérico/incorrecto (como "Un" o "De")
+                    if len(nombre) >= 2:
+                        self.registro_nombre = nombre
+                        self.registro_estado = "capturando_dinamico"
+                        self.registro_timer = time.time()
+                        self.registro_fotos_guardadas = 0
+                        self.encolar_saludo_groq("durante_registro", nombre)
+                        print(f"[AUTO-REGISTRO] Asistente iniciado directamente vía voz para '{nombre}'")
+                        return
+            
+            # 2. Comando de registro guiado: "Registrar", "Nuevo usuario", etc.
+            elif any(cmd in texto_lower for cmd in ["registrar", "registro", "nuevo usuario", "agregar usuario"]):
+                print("[VOZ] Comando de inicio de registro detectado.")
+                self.iniciar_registro_autonomo()
+                return
+                
+            # 3. Charla conversacional normal por defecto
             nombre = "Extraño"
             if self.cara_detectada_nombre and self.cara_detectada_nombre != "Desconocido":
                 nombre = self.cara_detectada_nombre
@@ -1024,8 +1059,10 @@ class SistemaReconocimientoFacial:
                         color = (0, 165, 255)
                         self.consecutivos_desconocidos += 1
                     
-                    if self.consecutivos_desconocidos >= 45:
+                    # Si no hay usuarios en la base de datos, iniciar auto-registro guiado una única vez al detectar a alguien
+                    if len(self.nombres_usuarios) == 0 and self.consecutivos_desconocidos >= 40:
                         self.iniciar_registro_autonomo()
+                        self.consecutivos_desconocidos = 0
                 
                 # 2. Modo Registro Activo
                 elif self.registro_estado is not None:
@@ -1085,6 +1122,9 @@ class SistemaReconocimientoFacial:
                 print("\n[SISTEMA] Cerrando aplicación y liberando recursos...")
                 self.stop_listener = True
                 break
+            elif key == ord('r') or key == ord('R'):
+                print("[SISTEMA] Solicitud de registro manual detectada por teclado.")
+                self.iniciar_registro_autonomo()
                 
         cap.release()
         cv2.destroyAllWindows()
