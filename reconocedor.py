@@ -16,21 +16,21 @@ from tkinter import simpledialog
 import speech_recognition as sr
 
 # =====================================================================
-# CONFIGURACIÓN Y CONSTANTES
+# CONFIGURACIÓN Y CONSTANTES (RESOLUCIÓN AMPLIADA)
 # =====================================================================
 DATASET_DIR = "dataset"
 TRAINER_FILE = "clasificador.yml"
 ATTENDANCE_FILE = "asistencia.csv"
 HAAR_FRONTAL_PATH = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
 HAAR_PROFILE_PATH = cv2.data.haarcascades + 'haarcascade_profileface.xml'
-WIDTH_RESIZE = 150
-HEIGHT_RESIZE = 150
+WIDTH_RESIZE = 200  # Resolución ampliada para capturar microfacciones
+HEIGHT_RESIZE = 200
 
 # Asegurar que las carpetas base existan
 if not os.path.exists(DATASET_DIR):
     os.makedirs(DATASET_DIR)
 
-# Hilo para la reproducción de voz (evita que el bucle de video se congele)
+# Hilo para la reproducción de voz
 voz_lock = threading.Lock()
 cola_saludos = deque(maxlen=5)
 
@@ -94,16 +94,18 @@ class SistemaReconocimientoFacial:
         # Ecualizador de contraste adaptable (CLAHE) para normalización de iluminación
         self.clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         
-        # Inicializar el reconocedor LBPH de OpenCV con hiperparámetros optimizados
+        # --- CONFIGURACIÓN MÁXIMA DE HISTOGRAMA LBPH (196 SUB-REGIONES) ---
+        # radius=3 (mayor alcance de patrones), neighbors=16 (muestreo de texturas ultra-detallado)
+        # grid_x/y=14 (división del rostro en 196 celdas espaciales para máxima resolución de firmas)
         self.recognizer = cv2.face.LBPHFaceRecognizer_create(
-            radius=2,
-            neighbors=12,
-            grid_x=10,
-            grid_y=10
+            radius=3,
+            neighbors=16,
+            grid_x=14,
+            grid_y=14
         )
         
         self.modelo_cargado = False
-        self.necesita_recargar_modelo = False  # Flag de control para recarga segura de modelo
+        self.necesita_recargar_modelo = False
         self.nombres_usuarios = {}
         self.cargar_modelo()
         
@@ -114,7 +116,7 @@ class SistemaReconocimientoFacial:
         self.memoria_deteccion = deque(maxlen=7)
         self.cara_detectada_nombre = None
         
-        # --- SEGUIDOR POR CENTROIDES (ID TEMPORAL) ---
+        # --- SEGUIDOR POR CENTROIDES ---
         self.ultimo_centroide = None
         
         # --- MÁQUINA DE ESTADOS PARA EL REGISTRO DE VOZ (ALEXA STYLE) ---
@@ -122,6 +124,7 @@ class SistemaReconocimientoFacial:
         self.registro_nombre = ""
         self.registro_timer = 0
         
+        # Ampliamos a 15 fotos de alta calidad (5 por categoría)
         self.registro_fotos_front = 0
         self.registro_fotos_profile = 0
         self.registro_fotos_dist = 0
@@ -159,7 +162,7 @@ class SistemaReconocimientoFacial:
         return None
 
     def generar_frase_llm(self, tipo, nombre=None, texto_conversacion=None):
-        """Genera una frase contextual humanizada, con personalidad e información del entorno usando Llama-3."""
+        """Genera una frase contextual humanizada y con personalidad usando Groq Llama-3."""
         if not self.groq_key:
             if tipo == "chat":
                 return "No tengo conexión a internet para charlar en este momento."
@@ -247,7 +250,7 @@ class SistemaReconocimientoFacial:
         return ""
 
     def cargar_modelo(self):
-        """Carga de forma segura el clasificador LBPH y actualiza el mapeo de nombres."""
+        """Carga el clasificador LBPH y actualiza el mapeo de nombres."""
         if os.path.exists(TRAINER_FILE):
             try:
                 self.recognizer.read(TRAINER_FILE)
@@ -269,16 +272,35 @@ class SistemaReconocimientoFacial:
         subdirs = sorted([d for d in os.listdir(DATASET_DIR) if os.path.isdir(os.path.join(DATASET_DIR, d))])
         self.nombres_usuarios = {i: name for i, name in enumerate(subdirs)}
 
+    def preprocesar_rostro_extremo(self, rostro_gris):
+        """
+        Aplica un pipeline avanzado para maximizar la nitidez de facciones:
+        1. Recorte de margen interno (8%) para eliminar cabello, orejas y ruido de pared.
+        2. Filtro Bilateral para eliminar ruido del sensor manteniendo bordes nítidos.
+        3. Ecualización adaptativa (CLAHE) local sobre el rostro para corregir sombras.
+        """
+        h, w = rostro_gris.shape
+        margin_x = int(w * 0.08)
+        margin_y = int(h * 0.08)
+        
+        # 1. Recorte interno
+        cara_recortada = rostro_gris[margin_y:h-margin_y, margin_x:w-margin_x]
+        
+        # 2. Filtro Bilateral (preserva bordes de ojos/nariz y suaviza imperfecciones/ruido)
+        cara_suave = cv2.bilateralFilter(cara_recortada, d=5, sigmaColor=50, sigmaSpace=50)
+        
+        # 3. CLAHE Local
+        cara_ecualizada = self.clahe.apply(cara_suave)
+        
+        # 4. Redimensionado bicúbico a resolución ampliada (200x200)
+        return cv2.resize(cara_ecualizada, (WIDTH_RESIZE, HEIGHT_RESIZE), interpolation=cv2.INTER_CUBIC)
+
     def entrenar_modelo(self):
-        """
-        Entrena el modelo LBPH usando un reconocedor temporal para evitar
-        conflictos de hilos (Thread-safe) con el bucle de predicción principal.
-        """
+        """Entrena el modelo LBPH usando procesamiento avanzado y thread-safety."""
         print("[IA ENTRENAMIENTO] Iniciando entrenamiento en segundo plano...")
         rostros = []
         ids = []
         
-        # Mapeo temporal local para la duración del entrenamiento
         if not os.path.exists(DATASET_DIR):
             return False
         subdirs = sorted([d for d in os.listdir(DATASET_DIR) if os.path.isdir(os.path.join(DATASET_DIR, d))])
@@ -299,27 +321,25 @@ class SistemaReconocimientoFacial:
                     
                 img_gris = cv2.imread(ruta_imagen, cv2.IMREAD_GRAYSCALE)
                 if img_gris is not None:
-                    # Normalización de iluminación local CLAHE
-                    img_gris = self.clahe.apply(img_gris)
-                    img_gris = cv2.resize(img_gris, (WIDTH_RESIZE, HEIGHT_RESIZE), interpolation=cv2.INTER_CUBIC)
-                    rostros.append(img_gris)
+                    # Aplicar preprocesamiento avanzado
+                    img_opt = self.preprocesar_rostro_extremo(img_gris)
+                    rostros.append(img_opt)
                     ids.append(usuario_id)
         
         if len(rostros) == 0:
             return False
             
         try:
-            # Crear reconocedor local aislado para entrenar
+            # Crear reconocedor temporal
             temp_recognizer = cv2.face.LBPHFaceRecognizer_create(
-                radius=2,
-                neighbors=12,
-                grid_x=10,
-                grid_y=10
+                radius=3,
+                neighbors=16,
+                grid_x=14,
+                grid_y=14
             )
             temp_recognizer.train(rostros, np.array(ids))
             temp_recognizer.write(TRAINER_FILE)
             
-            # Notificar al hilo principal para que cargue el archivo de forma segura
             self.necesita_recargar_modelo = True
             print("[IA ENTRENAMIENTO] Entrenamiento finalizado. Pendiente de recarga segura.")
             return True
@@ -508,12 +528,12 @@ class SistemaReconocimientoFacial:
         if len(archivos_categoria) >= 5:
             return
             
-        rostro_gris_opt = self.clahe.apply(rostro_gris)
-        rostro_red = cv2.resize(rostro_gris_opt, (WIDTH_RESIZE, HEIGHT_RESIZE), interpolation=cv2.INTER_CUBIC)
+        # Aplicar el preprocesamiento extremo antes de guardar
+        rostro_opt = self.preprocesar_rostro_extremo(rostro_gris)
         
         index = len(archivos_categoria)
         archivo_nombre = f"{nombre}_auto_{distancia_tag}_{index}.jpg"
-        cv2.imwrite(os.path.join(ruta_usuario, archivo_nombre), rostro_red)
+        cv2.imwrite(os.path.join(ruta_usuario, archivo_nombre), rostro_opt)
         
         self.fotos_auto_guardadas += 1
         print(f"[APRENDIZAJE ONLINE] Captura selectiva en [{distancia_tag.upper()}] ({index + 1}/5) para '{nombre}'")
@@ -523,13 +543,13 @@ class SistemaReconocimientoFacial:
             self.entrenar_en_segundo_plano()
 
     def procesar_captura_pasiva(self, rostro_gris, w_face, es_frontal):
-        """Guarda silenciosa e implícitamente las caras aplicando normalización CLAHE local."""
+        """Guarda silenciosa e implícitamente las caras aplicando normalización extrema."""
         ruta_usuario = os.path.join(DATASET_DIR, self.registro_nombre)
         if not os.path.exists(ruta_usuario):
             os.makedirs(ruta_usuario)
             
-        rostro_opt = self.clahe.apply(rostro_gris)
-        rostro_red = cv2.resize(rostro_opt, (WIDTH_RESIZE, HEIGHT_RESIZE), interpolation=cv2.INTER_CUBIC)
+        # Aplicar pipeline de preprocesamiento avanzado
+        rostro_opt = self.preprocesar_rostro_extremo(rostro_gris)
         
         if w_face >= 120:
             dist_tag = "cerca"
@@ -538,28 +558,28 @@ class SistemaReconocimientoFacial:
         else:
             dist_tag = "lejos"
             
-        if es_frontal and self.registro_fotos_front < 3:
+        if es_frontal and self.registro_fotos_front < 5:  # Ampliado a 5 fotos
             archivo = os.path.join(ruta_usuario, f"{self.registro_nombre}_front_{self.registro_fotos_front}.jpg")
-            cv2.imwrite(archivo, rostro_red)
+            cv2.imwrite(archivo, rostro_opt)
             self.registro_fotos_front += 1
-            print(f"[REGISTRO PASIVO] Foto Frontal Guardada ({self.registro_fotos_front}/3)")
+            print(f"[REGISTRO PASIVO] Foto Frontal Guardada ({self.registro_fotos_front}/5)")
             time.sleep(0.15)
             
-        elif not es_frontal and self.registro_fotos_profile < 3:
+        elif not es_frontal and self.registro_fotos_profile < 5:  # Ampliado a 5 fotos
             archivo = os.path.join(ruta_usuario, f"{self.registro_nombre}_profile_{self.registro_fotos_profile}.jpg")
-            cv2.imwrite(archivo, rostro_red)
+            cv2.imwrite(archivo, rostro_opt)
             self.registro_fotos_profile += 1
-            print(f"[REGISTRO PASIVO] Foto Perfil Guardada ({self.registro_fotos_profile}/3)")
+            print(f"[REGISTRO PASIVO] Foto Perfil Guardada ({self.registro_fotos_profile}/5)")
             time.sleep(0.15)
             
         else:
             fotos_dist = [f for f in os.listdir(ruta_usuario) if f.startswith(f"{self.registro_nombre}_dist_{dist_tag}_")]
-            if len(fotos_dist) < 3 and self.registro_fotos_dist < 3:
+            if len(fotos_dist) < 5 and self.registro_fotos_dist < 5:  # Ampliado a 5 fotos
                 index = len(fotos_dist)
                 archivo = os.path.join(ruta_usuario, f"{self.registro_nombre}_dist_{dist_tag}_{index}.jpg")
-                cv2.imwrite(archivo, rostro_red)
+                cv2.imwrite(archivo, rostro_opt)
                 self.registro_fotos_dist += 1
-                print(f"[REGISTRO PASIVO] Foto Distancia [{dist_tag.upper()}] Guardada ({self.registro_fotos_dist}/3)")
+                print(f"[REGISTRO PASIVO] Foto Distancia [{dist_tag.upper()}] Guardada ({self.registro_fotos_dist}/5)")
                 time.sleep(0.15)
 
     def dibujar_hud_futurista(self, frame, x, y, w, h, etiqueta, subtitulo, color):
@@ -611,8 +631,9 @@ class SistemaReconocimientoFacial:
         
         print("\nSISTEMA INTELIGENTE DE RECONOCIMIENTO FACIAL INICIADO (PRECISIÓN EXTREMA Y MULTIUSUARIOS).")
         print("Modo Conversacional y Autónomo Activo:")
-        print("  - Registro dinámico multiusuario ilimitado e instantáneo.")
-        print("  - Recarga segura de modelo (Thread-safe) en tiempo de ejecución sin interrupciones.")
+        print("  - LBPH de resolución extrema (196 sub-regiones, Vecinos 16, Radio 3).")
+        print("  - Pipeline avanzado: Filtro Bilateral + Margen 8% + CLAHE local.")
+        print("  - Filtro temporal estricto (4/7 votos para confirmación).")
         print("  - Presione 'Q' en la pantalla del video para salir.")
         print("-" * 60)
         
@@ -627,7 +648,7 @@ class SistemaReconocimientoFacial:
             frame_original = frame.copy()
             h_orig, w_orig = frame.shape[:2]
             
-            # --- RECARGA DE MODELO SEGURA (THREAD-SAFE) EN CALIENTE ---
+            # --- RECARGA DE MODELO SEGURA EN CALIENTE ---
             if self.necesita_recargar_modelo:
                 self.cargar_modelo()
                 self.necesita_recargar_modelo = False
@@ -668,7 +689,7 @@ class SistemaReconocimientoFacial:
             
             cara_detectada_este_frame = len(caras_combinadas) > 0
             
-            # --- MÁQUINA DE ESTADOS GLOBAL (REGISTRO Y CHARLA) ---
+            # --- MÁQUINA DE ESTADOS GLOBAL ---
             ahora = time.time()
             hud_color_global = (0, 255, 0)
             hud_texto_global = f"ASISTENTE: ESCANEANDO... | FPS: {fps:.1f} | REGISTRADOS: {len(self.nombres_usuarios)}"
@@ -716,16 +737,16 @@ class SistemaReconocimientoFacial:
                 
                 elif self.registro_estado == "capturando_dinamico":
                     total_capturas = self.registro_fotos_front + self.registro_fotos_profile + self.registro_fotos_dist
-                    hud_texto_global = f"REGISTRO ACTIVO: {self.registro_nombre.upper()} | CAPTURAS: {total_capturas}/9"
+                    hud_texto_global = f"REGISTRO ACTIVO: {self.registro_nombre.upper()} | CAPTURAS: {total_capturas}/15"
                     
-                    if self.registro_fotos_front >= 3 and self.registro_fotos_profile >= 3 and self.registro_fotos_dist >= 3:
+                    if self.registro_fotos_front >= 5 and self.registro_fotos_profile >= 5 and self.registro_fotos_dist >= 5:
                         self.entrenar_en_segundo_plano()
                         self.encolar_saludo_groq("registro_completo", self.registro_nombre)
                         
                         self.consecutivos_desconocidos = 0
                         self.memoria_deteccion.clear()
                         self.registro_estado = None
-                    elif ahora - self.registro_timer > 20.0:
+                    elif ahora - self.registro_timer > 30.0:  # Ampliado a 30s por tener 15 fotos
                         self.entrenar_en_segundo_plano()
                         encolar_saludo(f"Perfecto {self.registro_nombre}, he completado tu registro.")
                         self.consecutivos_desconocidos = 0
@@ -798,9 +819,8 @@ class SistemaReconocimientoFacial:
                 if self.registro_estado is None and self.chat_estado is None:
                     if self.modelo_cargado:
                         try:
-                            # Normalización de contraste local CLAHE
-                            cara_gris_norm = self.clahe.apply(cara_gris_recortada)
-                            cara_gris_norm = cv2.resize(cara_gris_norm, (WIDTH_RESIZE, HEIGHT_RESIZE), interpolation=cv2.INTER_CUBIC)
+                            # --- PREPROCESAMIENTO EXTREMO EN TIEMPO REAL ---
+                            cara_gris_norm = self.preprocesar_rostro_extremo(cara_gris_recortada)
                             
                             id_prediccion, distancia = self.recognizer.predict(cara_gris_norm)
                             confianza_pct = max(0, 100 - distancia)
@@ -816,9 +836,13 @@ class SistemaReconocimientoFacial:
                             else:
                                 voto_ganador = "Desconocido"
                                 
-                            if voto_ganador != "Desconocido":
+                            # --- FILTRADO TEMPORAL ESTRICTO ---
+                            # Exigimos al menos 4 de 7 frames coincidentes para confirmar identidad
+                            votos_winner = self.memoria_deteccion.count(voto_ganador)
+                            
+                            if voto_ganador != "Desconocido" and votos_winner >= 4:
                                 etiqueta = f"ACTIVO: {voto_ganador.upper()}"
-                                subtitulo = f"Match: {confianza_pct:.1f}% ({'Frente' if es_frontal else 'Perfil'})"
+                                subtitulo = f"Match: {confianza_pct:.1f}% ({votos_winner}/7 frames)"
                                 color = (0, 255, 0)
                                 
                                 self.consecutivos_desconocidos = 0
