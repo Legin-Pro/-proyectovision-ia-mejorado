@@ -162,6 +162,7 @@ class SistemaReconocimientoFacial:
         self.eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_eye.xml')
         self.smile_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_smile.xml')
         self.cajas_suavizadas = {}
+        self.confidence_historial = {}
         self.roi_box = None
         self.contador_frames = 0
         self.roi_fail_count = 0
@@ -1331,6 +1332,8 @@ class SistemaReconocimientoFacial:
             
             # Limpiar entradas antiguas del tracker (inactivas por más de 2 segundos)
             self.tracker_rostros = {fid: val for fid, val in self.tracker_rostros.items() if ahora - val[2] < 2.0}
+            self.confidence_historial = {fid: val for fid, val in self.confidence_historial.items() if fid in self.tracker_rostros}
+            self.cajas_suavizadas = {fid: val for fid, val in self.cajas_suavizadas.items() if fid in self.tracker_rostros}
             
             for (x_peq, y_peq, w_peq, h_peq) in caras_combinadas:
                 x = x_peq * escala
@@ -1433,8 +1436,39 @@ class SistemaReconocimientoFacial:
                     confianza_pct = pred["confianza"]
                     distancia = pred["distancia"]
                     
+                    # --- ESTABILIZACIÓN TEMPORAL POR FILTRO DE CONFIANZA EMA (KALMAN-STYLE) ---
+                    if face_id not in self.confidence_historial:
+                        self.confidence_historial[face_id] = {}
+                        
+                    # Inicializar/Actualizar el score de confianza para todos los nombres conocidos + Desconocido
+                    nombres_candidatos = list(self.nombres_usuarios.values()) + ["Desconocido"]
+                    for nom in nombres_candidatos:
+                        target = 0.0
+                        if nombre_detectado != "Identificando...":
+                            if nom == nombre_detectado:
+                                target = confianza_pct
+                            elif nom == "Desconocido" and nombre_detectado == "Desconocido":
+                                target = 100.0
+                                
+                        prev_conf = self.confidence_historial[face_id].get(nom, 0.0)
+                        # Media móvil ponderada para suavizar la confianza en el tiempo
+                        self.confidence_historial[face_id][nom] = 0.70 * prev_conf + 0.30 * target
+                        
+                    if nombre_detectado != "Identificando...":
+                        # Encontrar el nombre con mayor confianza acumulada en el historial
+                        nombre_estabilizado = max(self.confidence_historial[face_id], key=self.confidence_historial[face_id].get)
+                        conf_estabilizada = self.confidence_historial[face_id][nombre_estabilizado]
+                        
+                        # Si supera el umbral de persistencia, se acepta la identidad
+                        if conf_estabilizada > 45.0:
+                            nombre_detectado = nombre_estabilizado
+                            confianza_pct = conf_estabilizada
+                        else:
+                            nombre_detectado = "Desconocido"
+                            confianza_pct = self.confidence_historial[face_id].get("Desconocido", 0.0)
+                            
+                    # Asignar HUD según nombre estabilizado
                     if nombre_detectado != "Identificando..." and nombre_detectado != "Desconocido":
-                        # Si es con el que está charlando actualmente
                         if self.chat_estado is not None and nombre_detectado == self.chat_nombre:
                             etiqueta = f"HABLANDO: {nombre_detectado.upper()}"
                             color = (255, 100, 100)  # Color especial para el hablante activo
