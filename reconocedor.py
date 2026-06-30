@@ -1044,85 +1044,77 @@ class SistemaReconocimientoFacial:
                 
                 cara_gris_recortada = gris_opt[y_peq:y_peq+h_peq, x_peq:x_peq+w_peq]
                 
-                # 1. Modo Normal
-                if self.registro_estado is None and self.chat_estado is None:
-                    if self.modelo_cargado:
-                        try:
-                            # Preprocesamiento avanzado de rostros
-                            cara_gris_norm = self.preprocesar_rostro_extremo(cara_gris_recortada)
-                            
-                            id_prediccion, distancia = self.recognizer.predict(cara_gris_norm)
-                            confianza_pct = max(0, 100 - distancia)
-                            
-                            if confianza_pct > 48:
-                                nombre_detectado = self.nombres_usuarios.get(id_prediccion, "Desconocido")
-                                self.memoria_deteccion.append(nombre_detectado)
-                            else:
-                                nombre_detectado = "Desconocido"
-                                self.memoria_deteccion.append("Desconocido")
-                                
-                            # A. Estabilización de conversación mediante voto acumulado
-                            if len(self.memoria_deteccion) > 0:
-                                voto_ganador = max(set(self.memoria_deteccion), key=self.memoria_deteccion.count)
-                            else:
-                                voto_ganador = "Desconocido"
-                            votos_winner = self.memoria_deteccion.count(voto_ganador)
-                            
-                            # B. Dibujar información de manera individual para este rostro
-                            if nombre_detectado != "Desconocido":
-                                etiqueta = f"ACTIVO: {nombre_detectado.upper()}"
-                                subtitulo = f"Match: {confianza_pct:.1f}%"
-                                color = (0, 255, 0)
-                                self.consecutivos_desconocidos = 0
-                                nombre_actual_en_camara = nombre_detectado
-                            else:
-                                etiqueta = "DESCONOCIDO"
-                                subtitulo = f"Match: {confianza_pct:.1f}%"
-                                color = (0, 0, 255)
-                                self.consecutivos_desconocidos += 1
-                                
-                            # C. Disparar interacción y auto-aprendizaje solo para la persona ganadora y validada
-                            if voto_ganador != "Desconocido" and votos_winner >= 4 and nombre_detectado == voto_ganador:
-                                ahora_chat = time.time()
-                                if ahora_chat - self.ultimo_chat_voz.get(voto_ganador, 0) > 90.0:
-                                    self.ultimo_chat_voz[voto_ganador] = ahora_chat
-                                    self.iniciar_charla_conversacional(voto_ganador)
-                                
-                                self.guardar_asistencia(voto_ganador, confianza_pct)
-                                
-                                ahora_t = time.time()
-                                if ahora_t - ultimo_guardado_interactivo > 3.0:
-                                    self.auto_capturar_rostro_interaccion(voto_ganador, cara_gris_recortada, w)
-                                    ultimo_guardado_interactivo = ahora_t
-                                
-                        except Exception as e:
-                            subtitulo = f"Error IA: {e}"
-                            color = (0, 0, 255)
-                    else:
-                        etiqueta = "NUEVA PERSONA"
-                        subtitulo = "Auto-registro..."
-                        color = (0, 165, 255)
-                        self.consecutivos_desconocidos += 1
-                    
-                    # Si no hay usuarios en la base de datos, iniciar auto-registro guiado una única vez al detectar a alguien
-                    if len(self.nombres_usuarios) == 0 and self.consecutivos_desconocidos >= 40:
-                        self.iniciar_registro_autonomo()
-                        self.consecutivos_desconocidos = 0
-                
-                # 2. Modo Registro Activo
-                elif self.registro_estado is not None:
+                # 1. Modo Registro Activo
+                if self.registro_estado is not None:
                     etiqueta = f"REGISTRANDO: {self.registro_nombre.upper()}"
-                    subtitulo = "Mueve ligeramente tu rostro..."
+                    subtitulo = f"Capturas: {self.registro_fotos_guardadas}/15"
                     color = (0, 165, 255)
                     
                     if es_mismo_rostro or self.registro_fotos_guardadas == 0:
                         self.procesar_captura_pasiva(cara_gris_recortada)
                         
-                # 3. Modo Conversación Activo
-                elif self.chat_estado is not None:
-                    etiqueta = f"CHARLANDO CON {self.chat_nombre.upper()}"
-                    subtitulo = "Alexa: Conexión Activa (SSD Deep Learning)"
-                    color = (255, 100, 100)
+                # 2. Modo Normal / Conversación (Preprocesar y clasificar siempre)
+                else:
+                    nombre_detectado = "Desconocido"
+                    confianza_pct = 0.0
+                    distancia = 999.0
+                    
+                    if self.modelo_cargado:
+                        try:
+                            cara_gris_norm = self.preprocesar_rostro_extremo(cara_gris_recortada)
+                            id_prediccion, distancia = self.recognizer.predict(cara_gris_norm)
+                            confianza_pct = max(0, 100 - distancia)
+                            
+                            if confianza_pct > 48:
+                                nombre_detectado = self.nombres_usuarios.get(id_prediccion, "Desconocido")
+                        except Exception as e:
+                            print(f"[IA Predict Error] {e}")
+                            
+                    # Agregar a memoria de estabilización
+                    self.memoria_deteccion.append(nombre_detectado)
+                    
+                    if nombre_detectado != "Desconocido":
+                        # Si es con el que está charlando actualmente
+                        if self.chat_estado is not None and nombre_detectado == self.chat_nombre:
+                            etiqueta = f"HABLANDO: {nombre_detectado.upper()}"
+                            color = (255, 100, 100)  # Color especial para el hablante activo
+                        else:
+                            etiqueta = nombre_detectado.upper()
+                            color = (0, 255, 0)
+                        subtitulo = f"Match: {confianza_pct:.1f}%"
+                        self.consecutivos_desconocidos = 0
+                        nombre_actual_en_camara = nombre_detectado
+                    else:
+                        etiqueta = "DESCONOCIDO"
+                        subtitulo = f"Match: {confianza_pct:.1f}%"
+                        color = (0, 0, 255)
+                        self.consecutivos_desconocidos += 1
+                        
+                    # Procesar lógica conversacional y auto-aprendizaje sólo si es modo normal (sin registro)
+                    if self.registro_estado is None:
+                        if len(self.memoria_deteccion) > 0:
+                            voto_ganador = max(set(self.memoria_deteccion), key=self.memoria_deteccion.count)
+                        else:
+                            voto_ganador = "Desconocido"
+                        votos_winner = self.memoria_deteccion.count(voto_ganador)
+                        
+                        if voto_ganador != "Desconocido" and votos_winner >= 4 and nombre_detectado == voto_ganador:
+                            ahora_chat = time.time()
+                            if ahora_chat - self.ultimo_chat_voz.get(voto_ganador, 0) > 90.0:
+                                self.ultimo_chat_voz[voto_ganador] = ahora_chat
+                                self.iniciar_charla_conversacional(voto_ganador)
+                                
+                            self.guardar_asistencia(voto_ganador, confianza_pct)
+                            
+                            ahora_t = time.time()
+                            if ahora_t - ultimo_guardado_interactivo > 3.0:
+                                self.auto_capturar_rostro_interaccion(voto_ganador, cara_gris_recortada, w)
+                                ultimo_guardado_interactivo = ahora_t
+                                
+                        # Si no hay usuarios en la base de datos, iniciar auto-registro guiado una única vez al detectar a alguien
+                        if len(self.nombres_usuarios) == 0 and self.consecutivos_desconocidos >= 40:
+                            self.iniciar_registro_autonomo()
+                            self.consecutivos_desconocidos = 0
 
                 self.dibujar_hud_futurista(frame_original, x, y, w, h, etiqueta, subtitulo, color)
             
