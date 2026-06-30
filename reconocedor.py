@@ -14,7 +14,7 @@ import io
 import wave
 import sounddevice as sd
 import mediapipe as mp
-from mediapipe.python.solutions import face_detection as mp_face_detection
+from mediapipe.solutions import face_detection as mp_face_detection
 from collections import deque
 import tkinter as tk
 from tkinter import simpledialog
