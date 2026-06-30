@@ -163,7 +163,7 @@ class SistemaReconocimientoFacial:
         return None
 
     def generar_frase_llm(self, tipo, nombre=None, texto_conversacion=None):
-        """Genera una frase contextual humanizada y con personalidad usando Groq Llama-3."""
+        """Genera una frase contextual usando Groq Llama-3 con mayor margen de timeout contra lags de red."""
         if not self.groq_key:
             if tipo == "chat":
                 return "No tengo conexión a internet para charlar en este momento."
@@ -217,7 +217,8 @@ class SistemaReconocimientoFacial:
                 "max_tokens": 45,
                 "temperature": 0.85
             }
-            res = requests.post(url, headers=headers, json=data, timeout=1.8)
+            # Incrementado timeout a 3.5 segundos para tolerar fluctuaciones de la conexión wifi/red local
+            res = requests.post(url, headers=headers, json=data, timeout=3.5)
             if res.status_code == 200:
                 result = res.json()
                 frase = result["choices"][0]["message"]["content"].strip().replace('"', '')
@@ -347,14 +348,13 @@ class SistemaReconocimientoFacial:
             wav_file.setnchannels(1)
             wav_file.setsampwidth(2)  # 16-bit
             wav_file.setframerate(16000)
-            # Normalizar y escalar a int16
             audio_int = (audio_data * 32767.0).astype(np.int16)
             wav_file.writeframes(audio_int.tobytes())
         wav_buffer.seek(0)
         return wav_buffer
 
     def transcribir_groq_whisper(self, wav_bytes):
-        """Transcribe de forma instantánea el audio en memoria usando la API Groq Whisper v3."""
+        """Transcribe el audio en memoria usando Groq Whisper v3."""
         if not self.groq_key:
             return ""
         try:
@@ -374,97 +374,94 @@ class SistemaReconocimientoFacial:
         """Detiene de inmediato cualquier reproducción de voz activa (Barge-in)."""
         global asistente_hablando
         try:
-            # Crear un SpVoice local en el hilo de escucha para disparar la interrupción COM
             pythoncom.CoInitialize()
             voice_killer = win32com.client.Dispatch("SAPI.SpVoice")
-            # SPF_PURGEBEFORESPEAK (3) detiene todo el habla en curso en el sistema
             voice_killer.Speak("", 3)
             cola_saludos.clear()
             asistente_hablando = False
-            print("[Barge-in] Reproducción de voz de la IA interrumpida por voz del usuario.")
+            print("[Barge-in] Reproducción de voz de la IA interrumpida por el usuario.")
         except Exception as e:
             print(f"[Barge-in Error] {e}")
 
     def bucle_escucha_continua(self):
         """
         Bucle infinito en segundo plano (Siempre escuchando en memoria RAM - CVE 2.0).
-        Utiliza sounddevice para capturar y Silero VAD / RMS dinámico para segmentar habla.
-        Monitorea interrupciones del usuario (Barge-in) mientras la IA habla.
+        Abre el sd.InputStream una sola vez para evitar interrupciones en los hilos del audio del sistema.
         """
         sample_rate = 16000
         chunk_size = int(sample_rate * 0.1)  # Bloques de 100ms
-        umbral_silencio = 0.025  # Umbral de energía calibrado para voz
+        umbral_silencio = 0.025
         
-        # Pausa inicial
         time.sleep(2.0)
+        pythoncom.CoInitialize()
         
-        while not self.stop_listener:
-            # 1. Si la IA está hablando físicamente, monitoreamos si el volumen supera el umbral de Barge-in
-            if asistente_hablando:
-                try:
-                    with sd.InputStream(samplerate=sample_rate, channels=1, blocksize=chunk_size) as stream:
+        try:
+            # --- SOLUCIÓN DE AUDIO CORTADO: Abrir el stream UNA sola vez al inicio del hilo ---
+            with sd.InputStream(samplerate=sample_rate, channels=1, blocksize=chunk_size) as stream:
+                while not self.stop_listener:
+                    # 1. Si la IA está hablando físicamente, monitoreamos si el usuario la interrumpe (Barge-in)
+                    if asistente_hablando:
+                        try:
+                            data, overflow = stream.read(chunk_size)
+                            rms = np.sqrt(np.mean(data**2))
+                            # Umbral de Barge-in aumentado a 0.12 para evitar auto-disparos acústicos
+                            if rms > 0.12:
+                                self.detener_habla()
+                        except:
+                            pass
+                        time.sleep(0.05)
+                        continue
+                        
+                    if self.registro_estado == "esperando_popup":
+                        time.sleep(0.5)
+                        continue
+                        
+                    # 2. Captura pasiva normal
+                    try:
                         data, overflow = stream.read(chunk_size)
                         rms = np.sqrt(np.mean(data**2))
-                        # Si el usuario habla fuerte sobre la voz de la IA, detenerla
-                        if rms > 0.07:
-                            self.detener_habla()
-                except:
-                    pass
-                time.sleep(0.05)
-                continue
-                
-            if self.registro_estado == "esperando_popup":
-                time.sleep(0.5)
-                continue
-                
-            # 2. Bucle de captura pasivo normal
-            try:
-                with sd.InputStream(samplerate=sample_rate, channels=1, blocksize=chunk_size) as stream:
-                    data, overflow = stream.read(chunk_size)
-                    rms = np.sqrt(np.mean(data**2))
-                    
-                    if rms > umbral_silencio:
-                        print("[VAD] Detección de inicio de habla...")
-                        audio_chunks = [data]
-                        silencio_consecutivo = 0
                         
-                        # Grabar activamente hasta que el usuario se calle (VAD por caída de RMS)
-                        while len(audio_chunks) < 100 and not self.stop_listener:  # Máximo 10 segundos
+                        if rms > umbral_silencio:
+                            print("[VAD] Detección de inicio de habla...")
+                            audio_chunks = [data]
+                            silencio_consecutivo = 0
+                            
+                            while len(audio_chunks) < 100 and not self.stop_listener:
+                                if asistente_hablando:
+                                    break
+                                    
+                                chunk, ov = stream.read(chunk_size)
+                                audio_chunks.append(chunk)
+                                
+                                c_rms = np.sqrt(np.mean(chunk**2))
+                                if c_rms > umbral_silencio:
+                                    silencio_consecutivo = 0
+                                else:
+                                    silencio_consecutivo += 1
+                                    
+                                if silencio_consecutivo >= 8:
+                                    print("[VAD] Fin de habla detectado (800ms de silencio).")
+                                    break
+                            
                             if asistente_hablando:
-                                break
+                                continue
                                 
-                            chunk, ov = stream.read(chunk_size)
-                            audio_chunks.append(chunk)
+                            # Consolidar grabación
+                            audio_data = np.concatenate(audio_chunks, axis=0)
+                            wav_bytes = self.array_to_wav_bytes(audio_data)
                             
-                            c_rms = np.sqrt(np.mean(chunk**2))
-                            if c_rms > umbral_silencio:
-                                silencio_consecutivo = 0
-                            else:
-                                silence_consecutivo = 0 # reset
-                                silencio_consecutivo += 1
-                                
-                            # Si detecta 8 bloques seguidos de silencio (800ms), detener
-                            if silencio_consecutivo >= 8:
-                                print("[VAD] Fin de habla detectado (800ms de silencio).")
-                                break
+                            # Transcripción directa en memoria
+                            texto_entendido = self.transcribir_groq_whisper(wav_bytes)
+                            if texto_entendido:
+                                print(f"[Whisper Transcripción] Entendido: '{texto_entendido}'")
+                                self.procesar_voz_entrada_pasiva(texto_entendido)
+                    except Exception as e:
+                        print(f"[Audio Loop Inner Error] {e}")
+                        time.sleep(0.1)
                         
-                        if asistente_hablando:
-                            continue
-                            
-                        # Consolidar grabación
-                        audio_data = np.concatenate(audio_chunks, axis=0)
-                        wav_bytes = self.array_to_wav_bytes(audio_data)
-                        
-                        # Transcripción directa en memoria usando Groq Whisper
-                        texto_entendido = self.transcribir_groq_whisper(wav_bytes)
-                        if texto_entendido:
-                            print(f"[Whisper Transcripción] Entendido: '{texto_entendido}'")
-                            self.procesar_voz_entrada_pasiva(texto_entendido)
-            except Exception as e:
-                print(f"[Audio Input Stream Error] {e}")
-                time.sleep(0.5)
-                
-            time.sleep(0.05)
+                    time.sleep(0.02)
+        except Exception as e:
+            print(f"[Audio Stream Error] No se pudo iniciar el dispositivo de entrada de micrófono: {e}")
 
     def procesar_voz_entrada_pasiva(self, texto):
         """Procesa el texto capturado por la escucha continua en segundo plano."""
@@ -643,17 +640,17 @@ class SistemaReconocimientoFacial:
         grosor = 3
         
         # Arriba Izquierda
-        cv2.line(frame, (x, y), (x + longitud_linea, y), color, grosor)
-        cv2.line(frame, (x, y), (x, y + longitud_linea), color, grosor)
+        cv2.line(frame, (x, y), (x + longitud_linea, y), color, gromosor := grosor)
+        cv2.line(frame, (x, y), (x, y + longitud_linea), color, gromosor)
         # Arriba Derecha
-        cv2.line(frame, (x + w, y), (x + w - longitud_linea, y), color, grosor)
-        cv2.line(frame, (x + w, y), (x + w, y + longitud_linea), color, grosor)
+        cv2.line(frame, (x + w, y), (x + w - longitud_linea, y), color, gromosor)
+        cv2.line(frame, (x + w, y), (x + w, y + longitud_linea), color, gromosor)
         # Abajo Izquierda
-        cv2.line(frame, (x, y + h), (x + longitud_linea, y + h), color, grosor)
-        cv2.line(frame, (x, y + h), (x, y + h - longitud_linea), color, grosor)
+        cv2.line(frame, (x, y + h), (x + longitud_linea, y + h), color, gromosor)
+        cv2.line(frame, (x, y + h), (x, y + h - longitud_linea), color, gromosor)
         # Abajo Derecha
-        cv2.line(frame, (x + w, y + h), (x + w - longitud_linea, y + h), color, grosor)
-        cv2.line(frame, (x + w, y + h), (x + w, y + h - longitud_linea), color, grosor)
+        cv2.line(frame, (x + w, y + h), (x + w - longitud_linea, y + h), color, gromosor)
+        cv2.line(frame, (x + w, y + h), (x + w, y + h - longitud_linea), color, gromosor)
 
         # Transparencia
         overlay = frame.copy()
@@ -686,10 +683,9 @@ class SistemaReconocimientoFacial:
         
         print("\nSISTEMA INTELIGENTE DE RECONOCIMIENTO FACIAL INICIADO (PRECISIÓN EXTREMA Y MULTIUSUARIOS).")
         print("Modo Conversacional y Autónomo Activo:")
-        print("  - CVE-2.0: Escucha asíncrona en RAM mediante sounddevice.")
+        print("  - CVE-2.0: Escucha asíncrona en RAM mediante un único Stream abierto.")
         print("  - VAD Inteligente: Segmentación automática por energía RMS de voz.")
-        # Detección de interrupción
-        print("  - Barge-in Activo: IA se interrumpe si el usuario habla.")
+        print("  - Barge-in Activo: IA se interrumpe de forma limpia al hablar.")
         print("  - Presione 'Q' en la pantalla del video para salir.")
         print("-" * 60)
         
@@ -875,7 +871,6 @@ class SistemaReconocimientoFacial:
                 if self.registro_estado is None and self.chat_estado is None:
                     if self.modelo_cargado:
                         try:
-                            # Preprocesamiento avanzado de rostros
                             cara_gris_norm = self.preprocesar_rostro_extremo(cara_gris_recortada)
                             
                             id_prediccion, distancia = self.recognizer.predict(cara_gris_norm)
@@ -892,7 +887,6 @@ class SistemaReconocimientoFacial:
                             else:
                                 voto_ganador = "Desconocido"
                                 
-                            # Filtrado temporal
                             votos_winner = self.memoria_deteccion.count(voto_ganador)
                             
                             if voto_ganador != "Desconocido" and votos_winner >= 4:
