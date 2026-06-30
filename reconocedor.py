@@ -13,8 +13,6 @@ import win32com.client
 import io
 import wave
 import sounddevice as sd
-import mediapipe as mp
-from mediapipe.solutions import face_detection as mp_face_detection
 from collections import deque
 import tkinter as tk
 from tkinter import simpledialog
@@ -28,6 +26,10 @@ TRAINER_FILE = "clasificador.yml"
 ATTENDANCE_FILE = "asistencia.csv"
 WIDTH_RESIZE = 200  # Resolución ampliada para capturar microfacciones
 HEIGHT_RESIZE = 200
+
+# Archivos del modelo de Red Neuronal Profunda (DNN) de OpenCV para Rostros
+PROTO_PATH = "deploy.prototxt"
+MODEL_PATH = "res10_300x300_ssd_iter_140000.caffemodel"
 
 # Asegurar que las carpetas base existan
 if not os.path.exists(DATASET_DIR):
@@ -85,13 +87,11 @@ def encolar_saludo(texto):
 # =====================================================================
 class SistemaReconocimientoFacial:
     def __init__(self):
-        # --- INTEGRACIÓN DE MEDIAPIPE FACE DETECTION (PRECISIÓN EXTREMA A LARGA DISTANCIA) ---
-        # model_selection=1 configura el modelo de rango completo (óptimo hasta 5 metros)
-        self.mp_face_detection = mp_face_detection
-        self.face_detector = self.mp_face_detection.FaceDetection(
-            min_detection_confidence=0.55,
-            model_selection=1
-        )
+        # --- DESCARGA AUTOMÁTICA DEL MODELO DE DEEP LEARNING (RESNET-10 SSD) ---
+        self.descargar_archivos_dnn()
+        
+        # Cargar red neuronal profunda de OpenCV
+        self.net = cv2.dnn.readNetFromCaffe(PROTO_PATH, MODEL_PATH)
         
         # Ecualizador de contraste adaptable (CLAHE) para normalización de iluminación
         self.clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
@@ -123,10 +123,7 @@ class SistemaReconocimientoFacial:
         self.registro_estado = None
         self.registro_nombre = ""
         self.registro_timer = 0
-        
-        self.registro_fotos_front = 0
-        self.registro_fotos_profile = 0
-        self.registro_fotos_dist = 0
+        self.registro_fotos_guardadas = 0
         
         # --- MÁQUINA DE ESTADOS DE CONVERSACIÓN ACTIVA (LLM CHAT) ---
         self.chat_estado = None
@@ -146,6 +143,28 @@ class SistemaReconocimientoFacial:
         self.stop_listener = False
         self.hilo_escucha = threading.Thread(target=self.bucle_escucha_continua, daemon=True)
         self.hilo_escucha.start()
+
+    def descargar_archivos_dnn(self):
+        """Descarga deploy.prototxt y caffemodel si no existen localmente."""
+        if not os.path.exists(PROTO_PATH):
+            print("[INFO] Descargando deploy.prototxt del detector de rostros DNN...")
+            try:
+                url = "https://raw.githubusercontent.com/opencv/opencv/master/samples/dnn/face_detector/deploy.prototxt"
+                r = requests.get(url, timeout=10)
+                with open(PROTO_PATH, "wb") as f:
+                    f.write(r.content)
+            except Exception as e:
+                print(f"[ERROR] No se pudo descargar deploy.prototxt: {e}")
+                
+        if not os.path.exists(MODEL_PATH):
+            print("[INFO] Descargando res10_300x300_ssd_iter_140000.caffemodel (5.3 MB)...")
+            try:
+                url = "https://raw.githubusercontent.com/opencv/opencv_3rdparty/dnn_samples_face_detector_20170830/res10_300x300_ssd_iter_140000.caffemodel"
+                r = requests.get(url, timeout=15)
+                with open(MODEL_PATH, "wb") as f:
+                    f.write(r.content)
+            except Exception as e:
+                print(f"[ERROR] No se pudo descargar caffemodel: {e}")
 
     def cargar_groq_key(self):
         """Carga la clave API de Groq desde el archivo local .env."""
@@ -404,7 +423,6 @@ class SistemaReconocimientoFacial:
         
         if lecturas:
             avg_noise = np.mean(lecturas)
-            # Umbral dinámico: 1.6 veces el ruido ambiental. Límite seguro [0.015, 0.065]
             self.umbral_silencio = max(0.015, min(avg_noise * 1.6, 0.065))
             print(f"[SISTEMA VOZ] Calibración completa. Umbral VAD establecido en: {self.umbral_silencio:.4f}")
         else:
@@ -414,7 +432,7 @@ class SistemaReconocimientoFacial:
     def bucle_escucha_continua(self):
         """
         Bucle infinito en segundo plano (Siempre escuchando en memoria RAM - CVE 2.0).
-        Abre el sd.InputStream una sola vez y realiza calibración automática de ruido.
+        Realiza calibración automática de ruido.
         """
         sample_rate = 16000
         chunk_size = int(sample_rate * 0.1)  # Bloques de 100ms
@@ -424,16 +442,13 @@ class SistemaReconocimientoFacial:
         
         try:
             with sd.InputStream(samplerate=sample_rate, channels=1, blocksize=chunk_size) as stream:
-                # Autocalibrar el micrófono al abrir el flujo
                 self.calibrar_microfono(stream, chunk_size)
                 
                 while not self.stop_listener:
-                    # 1. Si la IA está hablando físicamente, monitoreamos si el usuario la interrumpe (Barge-in)
                     if asistente_hablando:
                         try:
                             data, overflow = stream.read(chunk_size)
                             rms = np.sqrt(np.mean(data**2))
-                            # Umbral de Barge-in dinámico
                             if rms > (self.umbral_silencio * 3.5):
                                 self.detener_habla()
                         except:
@@ -445,13 +460,12 @@ class SistemaReconocimientoFacial:
                         time.sleep(0.5)
                         continue
                         
-                    # 2. Captura pasiva normal
                     try:
                         data, overflow = stream.read(chunk_size)
                         rms = np.sqrt(np.mean(data**2))
                         
                         if rms > self.umbral_silencio:
-                            print(f"[VAD] Habla detectada (RMS: {rms:.4f} > Umbral: {self.umbral_silencio:.4f}). Graba...")
+                            print(f"[VAD] Habla detectada. Grabando...")
                             audio_chunks = [data]
                             silencio_consecutivo = 0
                             
@@ -469,13 +483,11 @@ class SistemaReconocimientoFacial:
                                     silencio_consecutivo += 1
                                     
                                 if silencio_consecutivo >= 8:
-                                    print("[VAD] Fin de habla detectado (800ms de silencio).")
                                     break
                             
                             if asistente_hablando:
                                 continue
                                 
-                            # Consolidar y enviar a Whisper
                             audio_data = np.concatenate(audio_chunks, axis=0)
                             wav_bytes = self.array_to_wav_bytes(audio_data)
                             
@@ -529,7 +541,7 @@ class SistemaReconocimientoFacial:
         root.destroy()
         
         if nombre:
-            self.input_nombre_resultado = nombre.strip().replace(" ", "_").capitalize()
+            self.input_nombre_resultado = name = nombre.strip().replace(" ", "_").capitalize()
         else:
             self.input_nombre_resultado = ""
         self.registro_estado = "procesando_voz"
@@ -599,31 +611,22 @@ class SistemaReconocimientoFacial:
         if not os.path.exists(ruta_usuario):
             return
             
-        if w_face >= 120:
-            distancia_tag = "cerca"
-        elif w_face >= 60:
-            distancia_tag = "medio"
-        else:
-            distancia_tag = "lejos"
-            
-        archivos_categoria = [f for f in os.listdir(ruta_usuario) if f.startswith(f"{nombre}_auto_{distancia_tag}_")]
-        if len(archivos_categoria) >= 5:
+        total_fotos = len([f for f in os.listdir(ruta_usuario) if f.endswith(".jpg")])
+        if total_fotos >= 30: # Límite de aprendizaje pasivo
             return
             
         rostro_opt = self.preprocesar_rostro_extremo(rostro_gris)
-        
-        index = len(archivos_categoria)
-        archivo_nombre = f"{nombre}_auto_{distancia_tag}_{index}.jpg"
+        archivo_nombre = f"{nombre}_auto_{total_fotos}.jpg"
         cv2.imwrite(os.path.join(ruta_usuario, archivo_nombre), rostro_opt)
         
         self.fotos_auto_guardadas += 1
-        print(f"[APRENDIZAJE ONLINE] Captura selectiva en [{distancia_tag.upper()}] ({index + 1}/5) para '{nombre}'")
+        print(f"[APRENDIZAJE ONLINE] Captura de pose pasiva ({total_fotos + 1}/30) para '{nombre}'")
         
-        if self.fotos_auto_guardadas >= 10:
+        if self.fotos_auto_guardadas >= 8:
             self.fotos_auto_guardadas = 0
             self.entrenar_en_segundo_plano()
 
-    def procesar_captura_pasiva(self, rostro_gris, w_face, es_frontal):
+    def procesar_captura_pasiva(self, rostro_gris):
         """Guarda silenciosa e implícitamente las caras aplicando normalización extrema."""
         ruta_usuario = os.path.join(DATASET_DIR, self.registro_nombre)
         if not os.path.exists(ruta_usuario):
@@ -631,36 +634,14 @@ class SistemaReconocimientoFacial:
             
         rostro_opt = self.preprocesar_rostro_extremo(rostro_gris)
         
-        if w_face >= 120:
-            dist_tag = "cerca"
-        elif w_face >= 60:
-            dist_tag = "medio"
-        else:
-            dist_tag = "lejos"
-            
-        if es_frontal and self.registro_fotos_front < 5:
-            archivo = os.path.join(ruta_usuario, f"{self.registro_nombre}_front_{self.registro_fotos_front}.jpg")
+        # Guardar secuencialmente hasta 15 fotos para registrar todos los ángulos
+        total_existentes = len([f for f in os.listdir(ruta_usuario) if f.endswith(".jpg")])
+        if total_existentes < 15:
+            archivo = os.path.join(ruta_usuario, f"{self.registro_nombre}_{total_existentes}.jpg")
             cv2.imwrite(archivo, rostro_opt)
-            self.registro_fotos_front += 1
-            print(f"[REGISTRO PASIVO] Foto Frontal Guardada ({self.registro_fotos_front}/5)")
-            time.sleep(0.15)
-            
-        elif not es_frontal and self.registro_fotos_profile < 5:
-            archivo = os.path.join(ruta_usuario, f"{self.registro_nombre}_profile_{self.registro_fotos_profile}.jpg")
-            cv2.imwrite(archivo, rostro_opt)
-            self.registro_fotos_profile += 1
-            print(f"[REGISTRO PASIVO] Foto Perfil Guardada ({self.registro_fotos_profile}/5)")
-            time.sleep(0.15)
-            
-        else:
-            fotos_dist = [f for f in os.listdir(ruta_usuario) if f.startswith(f"{self.registro_nombre}_dist_{dist_tag}_")]
-            if len(fotos_dist) < 5 and self.registro_fotos_dist < 5:
-                index = len(fotos_dist)
-                archivo = os.path.join(ruta_usuario, f"{self.registro_nombre}_dist_{dist_tag}_{index}.jpg")
-                cv2.imwrite(archivo, rostro_opt)
-                self.registro_fotos_dist += 1
-                print(f"[REGISTRO PASIVO] Foto Distancia [{dist_tag.upper()}] Guardada ({self.registro_fotos_dist}/5)")
-                time.sleep(0.15)
+            self.registro_fotos_guardadas = total_existentes + 1
+            print(f"[REGISTRO PASIVO] Foto Guardada ({self.registro_fotos_guardadas}/15)")
+            time.sleep(0.2)  # Retardo para capturar variación natural de poses
 
     def dibujar_hud_futurista(self, frame, x, y, w, h, etiqueta, subtitulo, color):
         """Dibuja brackets esquineros, barra de fondo y escáner sobre el rostro."""
@@ -704,10 +685,9 @@ class SistemaReconocimientoFacial:
         fps = 0
         ultimo_guardado_interactivo = 0
         
-        print("\nSISTEMA INTELIGENTE DE RECONOCIMIENTO FACIAL INICIADO (MEDIAPIPE & WHISPER).")
+        print("\nSISTEMA INTELIGENTE DE RECONOCIMIENTO FACIAL INICIADO (OPENCV DEEP LEARNING & WHISPER).")
         print("Modo Conversacional y Autónomo Activo:")
-        print("  - Detección de Rostros: Google MediaPipe (Rango completo 0 a 5 metros).")
-        print("  - Estimación de Pose: Asimetría geométrica por landmarks en tiempo real.")
+        print("  - Detección de Rostros: ResNet-10 SSD (Red Neuronal Profunda - Rango completo hasta 5m).")
         print("  - Audio: Calibración dinámica de ruido ambiental y ganancia automática AGC.")
         print("  - Presione 'Q' en la pantalla del video para salir.")
         print("-" * 60)
@@ -735,53 +715,35 @@ class SistemaReconocimientoFacial:
             alto_red = h_orig // escala
             frame_pequeno = cv2.resize(frame, (ancho_red, alto_red))
             
-            # MediaPipe requiere formato RGB
-            rgb_frame = cv2.cvtColor(frame_pequeno, cv2.COLOR_BGR2RGB)
-            results = self.face_detector.process(rgb_frame)
+            # Detección profunda usando el modelo DNN ResNet-10 SSD
+            blob = cv2.dnn.blobFromImage(frame_pequeno, 1.0, (300, 300), (104.0, 177.0, 123.0))
+            self.net.setInput(blob)
+            detections = self.net.forward()
             
-            # Convertir frame de búsqueda a escala de grises para el clasificador LBPH
             gris = cv2.cvtColor(frame_pequeno, cv2.COLOR_BGR2GRAY)
             gris_opt = self.clahe.apply(gris)
             
             caras_combinadas = []
             
-            # --- PROCESAR DETECCIONES DE MEDIAPIPE ---
-            if results.detections:
-                for detection in results.detections:
-                    bbox = detection.location_data.relative_bounding_box
+            for i in range(detections.shape[2]):
+                confidence = detections[0, 0, i, 2]
+                if confidence > 0.55:  # Umbral de confianza de detección
+                    x_start = int(detections[0, 0, i, 3] * ancho_red)
+                    y_start = int(detections[0, 0, i, 4] * alto_red)
+                    x_end = int(detections[0, 0, i, 5] * ancho_red)
+                    y_end = int(detections[0, 0, i, 6] * alto_red)
                     
-                    x_peq = int(bbox.xmin * ancho_red)
-                    y_peq = int(bbox.ymin * alto_red)
-                    w_peq = int(bbox.width * ancho_red)
-                    h_peq = int(bbox.height * alto_red)
+                    wf = x_end - x_start
+                    hf = y_end - y_start
                     
-                    # Forzar límites
-                    x_peq = max(0, x_peq)
-                    y_peq = max(0, y_peq)
-                    w_peq = min(w_peq, ancho_red - x_peq)
-                    h_peq = min(h_peq, alto_red - y_peq)
+                    # Forzar límites de imagen
+                    x_start = max(0, x_start)
+                    y_start = max(0, y_start)
+                    wf = min(wf, ancho_red - x_start)
+                    hf = min(hf, alto_red - y_start)
                     
-                    if w_peq > 15 and h_peq > 15:
-                        # --- ESTIMACIÓN DE POSE POR LANDMARKS GEOMÉTRICOS ---
-                        keypoints = detection.location_data.relative_keypoints
-                        es_frontal = True
-                        
-                        if len(keypoints) >= 3:
-                            kp_ojo_izq = keypoints[0]  # Ojo izquierdo en imagen (derecho de la persona)
-                            kp_ojo_der = keypoints[1]  # Ojo derecho en imagen (izquierdo de la persona)
-                            kp_nariz = keypoints[2]
-                            
-                            dist_ojos = kp_ojo_der.x - kp_ojo_izq.x
-                            dist_nariz_izq = kp_nariz.x - kp_ojo_izq.x
-                            
-                            if dist_ojos > 1e-5:
-                                ratio = dist_nariz_izq / dist_ojos
-                                # Si la nariz está centrada entre ambos ojos, la pose es frontal.
-                                # De lo contrario, se cataloga como perfil (giro de cabeza).
-                                if ratio < 0.35 or ratio > 0.65:
-                                    es_frontal = False
-                        
-                        caras_combinadas.append((x_peq, y_peq, w_peq, h_peq, es_frontal))
+                    if wf > 15 and hf > 15:
+                        caras_combinadas.append((x_start, y_start, wf, hf))
             
             cara_detectada_este_frame = len(caras_combinadas) > 0
             
@@ -816,9 +778,7 @@ class SistemaReconocimientoFacial:
                             self.registro_nombre = self.input_nombre_resultado
                             self.registro_estado = "capturando_dinamico"
                             self.registro_timer = ahora
-                            self.registro_fotos_front = 0
-                            self.registro_fotos_profile = 0
-                            self.registro_fotos_dist = 0
+                            self.registro_fotos_guardadas = 0
                             
                             self.encolar_saludo_groq("durante_registro", self.registro_nombre)
                             print(f"[AUTO-REGISTRO] Asistente iniciado para '{self.registro_nombre}'")
@@ -832,10 +792,9 @@ class SistemaReconocimientoFacial:
                     hud_texto_global = "ASISTENTE: ESPERANDO NOMBRE EN POPUP..."
                 
                 elif self.registro_estado == "capturando_dinamico":
-                    total_capturas = self.registro_fotos_front + self.registro_fotos_profile + self.registro_fotos_dist
-                    hud_texto_global = f"REGISTRO ACTIVO: {self.registro_nombre.upper()} | CAPTURAS: {total_capturas}/15"
+                    hud_texto_global = f"REGISTRO ACTIVO: {self.registro_nombre.upper()} | CAPTURAS: {self.registro_fotos_guardadas}/15"
                     
-                    if self.registro_fotos_front >= 5 and self.registro_fotos_profile >= 5 and self.registro_fotos_dist >= 5:
+                    if self.registro_fotos_guardadas >= 15:
                         self.entrenar_en_segundo_plano()
                         self.encolar_saludo_groq("registro_completo", self.registro_nombre)
                         
@@ -888,7 +847,7 @@ class SistemaReconocimientoFacial:
             # --- PROCESAR ROSTROS DETECTADOS ---
             nombre_actual_en_camara = None
             
-            for (x_peq, y_peq, w_peq, h_peq, es_frontal) in caras_combinadas:
+            for (x_peq, y_peq, w_peq, h_peq) in caras_combinadas:
                 x = x_peq * escala
                 y = y_peq * escala
                 w = w_peq * escala
@@ -973,18 +932,17 @@ class SistemaReconocimientoFacial:
                 
                 # 2. Modo Registro Activo
                 elif self.registro_estado is not None:
-                    pose_tag = "Frontal" if es_frontal else "Perfil"
                     etiqueta = f"REGISTRANDO: {self.registro_nombre.upper()}"
-                    subtitulo = f"Pose: {pose_tag.upper()}"
+                    subtitulo = "Mueve ligeramente tu rostro..."
                     color = (0, 165, 255)
                     
-                    if es_mismo_rostro or self.registro_fotos_front == 0:
-                        self.procesar_captura_pasiva(cara_gris_recortada, w, es_frontal)
+                    if es_mismo_rostro or self.registro_fotos_guardadas == 0:
+                        self.procesar_captura_pasiva(cara_gris_recortada)
                         
                 # 3. Modo Conversación Activo
                 elif self.chat_estado is not None:
                     etiqueta = f"CHARLANDO CON {self.chat_nombre.upper()}"
-                    subtitulo = f"Alexa: Conexión Activa ({'Frente' if es_frontal else 'Perfil'})"
+                    subtitulo = "Alexa: Conexión Activa (SSD Deep Learning)"
                     color = (255, 100, 100)
 
                 self.dibujar_hud_futurista(frame_original, x, y, w, h, etiqueta, subtitulo, color)
@@ -997,6 +955,11 @@ class SistemaReconocimientoFacial:
                 if self.consecutivos_desconocidos > 0:
                     self.consecutivos_desconocidos -= 1
             
+            # HUD Superior de Estado General
+            cv2.rectangle(frame_original, (0, 0), (w_orig, 40), (15, 15, 15), -1)
+            cv2.putText(frame_original, hud_texto_global, (15, 25),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, hud_color_global, 1, cv2.LINE_AA)
+            
             cv2.imshow("Antigravity Smart Recognition HUD", frame_original)
             
             t_fin = time.time()
@@ -1006,7 +969,6 @@ class SistemaReconocimientoFacial:
             if key == ord('q') or key == ord('Q'):
                 print("\n[SISTEMA] Cerrando aplicación y liberando recursos...")
                 self.stop_listener = True
-                self.face_detector.close()
                 break
                 
         cap.release()
