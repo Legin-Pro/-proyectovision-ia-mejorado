@@ -43,33 +43,81 @@ cola_saludos = deque(maxlen=5)
 asistente_hablando = False
 
 def hablar_worker():
-    """Ejecuta en segundo plano la síntesis de voz usando SAPI5 nativo de Windows (win32com)."""
+    """Ejecuta en segundo plano la síntesis de voz usando Microsoft Edge Neural TTS (Voz Humana) 
+    o SAPI5 como fallback local offline."""
     global asistente_hablando
     pythoncom.CoInitialize()
+    
+    # Intentar cargar SAPI5 para fallback offline
+    sapi_voice = None
     try:
-        voice = win32com.client.Dispatch("SAPI.SpVoice")
-        voice.Rate = -1  # Ritmo de habla más natural, pausado y humano
-        voices = voice.GetVoices()
+        sapi_voice = win32com.client.Dispatch("SAPI.SpVoice")
+        sapi_voice.Rate = -1
+        voices = sapi_voice.GetVoices()
         for i in range(voices.Count):
             v_desc = voices.Item(i).GetDescription()
             if "spanish" in v_desc.lower() or "español" in v_desc.lower() or "es-ES" in v_desc.lower():
-                voice.Voice = voices.Item(i)
+                sapi_voice.Voice = voices.Item(i)
                 break
     except Exception as e:
-        print(f"[Voz Error] No se pudo instanciar SAPI5: {e}")
-        return
+        print(f"[Voz Error] No se pudo instanciar SAPI5 para fallback: {e}")
+
+    # Inicializar reproductor de Windows Media Player (nativo sin dependencias)
+    player = None
+    try:
+        player = win32com.client.Dispatch("WMPlayer.OCX")
+    except Exception as e:
+        print(f"[Voz Error] No se pudo instanciar WMPlayer.OCX: {e}")
+
+    temp_audio = os.path.join(os.path.dirname(os.path.abspath(__file__)), "temp_voz.mp3")
 
     while True:
         if cola_saludos:
             texto = cola_saludos.popleft()
             with voz_lock:
+                asistente_hablando = True
+                hablado_con_edge = False
+                
+                # Intentar usar Edge Neural TTS si edge_tts está instalado
                 try:
-                    asistente_hablando = True
-                    voice.Speak(texto, 0)
-                    asistente_hablando = False
+                    import edge_tts
+                    # Generar audio asíncronamente
+                    async def generar():
+                        # Usamos es-MX-DaliaNeural para una voz cálida, natural e increíblemente fluida
+                        communicate = edge_tts.Communicate(texto, "es-MX-DaliaNeural")
+                        await communicate.save(temp_audio)
+                    
+                    import asyncio
+                    asyncio.run(generar())
+                    
+                    if player is not None and os.path.exists(temp_audio):
+                        player.URL = temp_audio
+                        player.controls.play()
+                        # Esperar a que termine de reproducir
+                        time.sleep(0.2) # Pequeño margen para iniciar
+                        # Esperar mientras esté en estado de reproducción (3 = wmppsPlaying, 9 = wmppsTransitioning)
+                        while player.playState in [3, 9, 6]: 
+                            time.sleep(0.05)
+                        hablado_con_edge = True
                 except Exception as e:
-                    print(f"[Voz Error] Error de reproducción SAPI5: {e}")
-                    asistente_hablando = False
+                    # Si falla por internet o librería no instalada, pasará al fallback
+                    pass
+                
+                # Fallback a SAPI5 si Edge TTS no funcionó
+                if not hablado_con_edge and sapi_voice is not None:
+                    try:
+                        sapi_voice.Speak(texto, 0)
+                    except Exception as e:
+                        print(f"[Voz Error] Error de reproducción SAPI5: {e}")
+                
+                # Limpiar archivo temporal si existe
+                if os.path.exists(temp_audio):
+                    try:
+                        os.remove(temp_audio)
+                    except:
+                        pass
+                        
+                asistente_hablando = False
         else:
             time.sleep(0.1)
 
@@ -502,11 +550,13 @@ class SistemaReconocimientoFacial:
             else:
                 nombre = "Desconocido"
                 
-            # 5. Guardar predicción
+            # 5. Guardar predicción con estado de bloqueo biométrico
+            es_seguro = (nombre != "Desconocido" and distancia < 44.0)
             self.predicciones_activas[face_id] = {
                 "nombre": nombre,
                 "confianza": confianza_pct,
                 "distancia": distancia,
+                "locked": es_seguro,
                 "tiempo": time.time()
             }
             
@@ -1415,9 +1465,13 @@ class SistemaReconocimientoFacial:
                         self.dibujar_hud_futurista(frame_original, x_draw, y_draw, w_draw, h_draw, etiqueta, subtitulo, color)
                         continue
                         
-                    # Lanzar clasificación asíncrona si ha pasado el intervalo (4 veces por segundo por rostro)
+                    # Lanzar clasificación asíncrona si ha pasado el intervalo (si está bloqueado biométricamente, verificar solo cada 2 segundos)
+                    pred_actual = self.predicciones_activas.get(face_id, {})
+                    es_bloqueado = pred_actual.get("locked", False)
+                    intervalo = 2.0 if es_bloqueado else 0.25
+                    
                     ultimo_t = self.ultimo_tiempo_clasificacion.get(face_id, 0.0)
-                    if ahora - ultimo_t > 0.25:
+                    if ahora - ultimo_t > intervalo:
                         self.ultimo_tiempo_clasificacion[face_id] = ahora
                         threading.Thread(
                             target=self.clasificar_rostro_async,
