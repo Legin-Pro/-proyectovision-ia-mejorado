@@ -133,6 +133,10 @@ class SistemaReconocimientoFacial:
         self.registro_nombre = ""
         self.registro_timer = 0
         self.registro_fotos_guardadas = 0
+        self.registro_paso = 1
+        self.registro_paso_fotos_guardadas = 0
+        self.registro_paso_hablado = False
+        self.registro_paso_timer = 0.0
         
         # --- MÁQUINA DE ESTADOS DE CONVERSACIÓN ACTIVA (LLM CHAT) ---
         self.chat_estado = None
@@ -653,6 +657,10 @@ class SistemaReconocimientoFacial:
                     self.registro_estado = "capturando_dinamico"
                     self.registro_timer = time.time()
                     self.registro_fotos_guardadas = 0
+                    self.registro_paso = 1
+                    self.registro_paso_fotos_guardadas = 0
+                    self.registro_paso_hablado = False
+                    self.registro_paso_timer = time.time()
                     self.encolar_saludo_groq("durante_registro", nombre)
                     print(f"[AUTO-REGISTRO] Asistente iniciado directamente vía voz para '{nombre}'")
                     return
@@ -705,6 +713,10 @@ class SistemaReconocimientoFacial:
         self.registro_estado = "preguntando"
         self.registro_timer = time.time()
         self.registro_fotos_guardadas = 0
+        self.registro_paso = 1
+        self.registro_paso_fotos_guardadas = 0
+        self.registro_paso_hablado = False
+        self.registro_paso_timer = 0.0
         self.input_nombre_resultado = None
         self.encolar_saludo_groq("saludo_nuevo")
 
@@ -785,10 +797,18 @@ class SistemaReconocimientoFacial:
             self.entrenar_en_segundo_plano()
 
     def procesar_captura_pasiva(self, rostro_gris):
-        """Guarda silenciosa e implícitamente las caras aplicando normalización extrema y asíncrona."""
+        """Guarda silenciosa e implícitamente las caras aplicando normalización extrema y asíncrona por pasos/poses."""
+        if self.registro_nombre is None or self.registro_estado != "capturando_dinamico":
+            return
+            
+        # Si la IA está hablando (dando instrucciones), pausar la captura temporalmente
+        if asistente_hablando:
+            return
+            
         ahora = time.time()
-        # Controlar la velocidad de captura sin congelar el hilo del video (mínimo 250ms entre fotos)
-        if ahora - self.ultimo_tiempo_foto < 0.25:
+        
+        # Controlar la velocidad de captura (mínimo 400ms entre fotos de la misma pose para dar tiempo a micro-variaciones)
+        if ahora - self.ultimo_tiempo_foto < 0.40:
             return
             
         self.ultimo_tiempo_foto = ahora
@@ -797,9 +817,7 @@ class SistemaReconocimientoFacial:
         if not os.path.exists(ruta_usuario):
             os.makedirs(ruta_usuario)
             
-        rostro_opt = self.preprocesar_rostro_extremo(rostro_gris)
-        
-        # Limpiar al empezar si es la primera foto del ciclo de registro activo
+        # Limpiar al empezar si es el primer paso y la primera foto
         if self.registro_fotos_guardadas == 0:
             for f in os.listdir(ruta_usuario):
                 if f.endswith(".jpg"):
@@ -808,14 +826,22 @@ class SistemaReconocimientoFacial:
                     except:
                         pass
                         
-        total_existentes = len([f for f in os.listdir(ruta_usuario) if f.endswith(".jpg")])
-        if total_existentes < 15:
-            archivo = os.path.join(ruta_usuario, f"{self.registro_nombre}_{total_existentes}.jpg")
-            # --- MEJORA RENDIMIENTO: Escritura asíncrona en disco en un hilo daemon ---
-            threading.Thread(target=cv2.imwrite, args=(archivo, rostro_opt), daemon=True).start()
-            
-            self.registro_fotos_guardadas = total_existentes + 1
-            print(f"[REGISTRO PASIVO] Foto Encolada Asíncronamente ({self.registro_fotos_guardadas}/15)")
+        rostro_opt = self.preprocesar_rostro_extremo(rostro_gris)
+        
+        self.registro_fotos_guardadas += 1
+        self.registro_paso_fotos_guardadas += 1
+        
+        archivo = os.path.join(ruta_usuario, f"{self.registro_nombre}_{self.registro_fotos_guardadas}.jpg")
+        # Escritura asíncrona en disco en un hilo daemon
+        threading.Thread(target=cv2.imwrite, args=(archivo, rostro_opt), daemon=True).start()
+        
+        print(f"[REGISTRO PASIVO] Paso {self.registro_paso}/5 - Foto {self.registro_paso_fotos_guardadas}/3 Guardada ({self.registro_fotos_guardadas}/15)")
+        
+        # Avanzar de paso si ya capturamos 3 imágenes en este paso
+        if self.registro_paso_fotos_guardadas >= 3 and self.registro_paso < 5:
+            self.registro_paso += 1
+            self.registro_paso_fotos_guardadas = 0
+            self.registro_paso_hablado = False
 
     def dibujar_hud_futurista(self, frame, x, y, w, h, etiqueta, subtitulo, color):
         """Dibuja brackets esquineros, barra de fondo y escáner sobre el rostro."""
@@ -953,6 +979,10 @@ class SistemaReconocimientoFacial:
                             self.registro_estado = "capturando_dinamico"
                             self.registro_timer = ahora
                             self.registro_fotos_guardadas = 0
+                            self.registro_paso = 1
+                            self.registro_paso_fotos_guardadas = 0
+                            self.registro_paso_hablado = False
+                            self.registro_paso_timer = ahora
                             
                             self.encolar_saludo_groq("durante_registro", self.registro_nombre)
                             print(f"[AUTO-REGISTRO] Asistente iniciado para '{self.registro_nombre}'")
@@ -966,16 +996,45 @@ class SistemaReconocimientoFacial:
                     hud_texto_global = "ASISTENTE: ESPERANDO NOMBRE EN POPUP..."
                 
                 elif self.registro_estado == "capturando_dinamico":
-                    hud_texto_global = f"REGISTRO ACTIVO: {self.registro_nombre.upper()} | CAPTURAS: {self.registro_fotos_guardadas}/15"
-                    
+                    # Guiado por voz interactivo y por pasos/poses
+                    if self.registro_paso == 1:
+                        if not self.registro_paso_hablado:
+                            encolar_saludo(f"Hola {self.registro_nombre}, iniciemos tu registro. Por favor mira de frente al centro y quédate serio.")
+                            self.registro_paso_hablado = True
+                            self.registro_paso_timer = ahora
+                        hud_texto_global = f"REGISTRO: PASO 1/5 - MIRA DE FRENTE [SERIO]"
+                    elif self.registro_paso == 2:
+                        if not self.registro_paso_hablado:
+                            encolar_saludo("Perfecto. Ahora mira de frente y sonríe.")
+                            self.registro_paso_hablado = True
+                            self.registro_paso_timer = ahora
+                        hud_texto_global = f"REGISTRO: PASO 2/5 - MIRA DE FRENTE [SONRÍE]"
+                    elif self.registro_paso == 3:
+                        if not self.registro_paso_hablado:
+                            encolar_saludo("Muy bien. Gira tu cabeza un poco hacia la izquierda.")
+                            self.registro_paso_hablado = True
+                            self.registro_paso_timer = ahora
+                        hud_texto_global = f"REGISTRO: PASO 3/5 - GIRA A LA IZQUIERDA"
+                    elif self.registro_paso == 4:
+                        if not self.registro_paso_hablado:
+                            encolar_saludo("Entendido. Ahora gira tu cabeza un poco hacia la derecha.")
+                            self.registro_paso_hablado = True
+                            self.registro_paso_timer = ahora
+                        hud_texto_global = f"REGISTRO: PASO 4/5 - GIRA A LA DERECHA"
+                    elif self.registro_paso == 5:
+                        if not self.registro_paso_hablado:
+                            encolar_saludo("Casi listo. Por último, mira un poco hacia arriba.")
+                            self.registro_paso_hablado = True
+                            self.registro_paso_timer = ahora
+                        hud_texto_global = f"REGISTRO: PASO 5/5 - MIRA HACIA ARRRIBA"
+                        
                     if self.registro_fotos_guardadas >= 15:
                         self.entrenar_en_segundo_plano()
                         self.encolar_saludo_groq("registro_completo", self.registro_nombre)
-                        
                         self.consecutivos_desconocidos = 0
                         self.memoria_deteccion.clear()
                         self.registro_estado = None
-                    elif ahora - self.registro_timer > 30.0:
+                    elif ahora - self.registro_timer > 60.0:  # Límite extendido a 60 segundos
                         self.entrenar_en_segundo_plano()
                         encolar_saludo(f"Perfecto {self.registro_nombre}, he completado tu registro.")
                         self.consecutivos_desconocidos = 0
@@ -1047,7 +1106,18 @@ class SistemaReconocimientoFacial:
                 # 1. Modo Registro Activo
                 if self.registro_estado is not None:
                     etiqueta = f"REGISTRANDO: {self.registro_nombre.upper()}"
-                    subtitulo = f"Capturas: {self.registro_fotos_guardadas}/15"
+                    if self.registro_paso == 1:
+                        subtitulo = "Paso 1/5: Mira al frente (serio)"
+                    elif self.registro_paso == 2:
+                        subtitulo = "Paso 2/5: Mira al frente (sonrie)"
+                    elif self.registro_paso == 3:
+                        subtitulo = "Paso 3/5: Gira a la izquierda"
+                    elif self.registro_paso == 4:
+                        subtitulo = "Paso 4/5: Gira a la derecha"
+                    elif self.registro_paso == 5:
+                        subtitulo = "Paso 5/5: Mira hacia arriba"
+                    else:
+                        subtitulo = f"Capturas: {self.registro_fotos_guardadas}/15"
                     color = (0, 165, 255)
                     
                     if es_mismo_rostro or self.registro_fotos_guardadas == 0:
