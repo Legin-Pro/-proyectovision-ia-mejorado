@@ -505,32 +505,44 @@ class SistemaReconocimientoFacial:
 
     def procesar_voz_entrada_pasiva(self, texto):
         """Procesa el texto capturado por la escucha continua en segundo plano."""
+        texto_limpio = texto.strip()
+        if not texto_limpio:
+            return
+            
+        print(f"[VOZ A TEXTO] Transcripción recibida: '{texto_limpio}'")
+        
         if self.registro_estado == "escuchando":
-            palabras = texto.strip().split()
+            palabras = texto_limpio.split()
             nombre = None
             if palabras:
                 if len(palabras) >= 3 and palabras[0].lower() in ["me", "mi"] and palabras[1].lower() in ["llamo", "nombre"]:
                     nombre = palabras[2]
                 else:
                     nombre = palabras[0]
+            if nombre:
+                nombre = ''.join(c for c in nombre if c.isalnum()).capitalize()
             self.input_nombre_resultado = nombre
             self.registro_estado = "procesando_voz"
             
         elif self.chat_estado is not None:
+            print("[FLUJO IA] Enviando texto a la conversación activa con Groq...")
             self.chat_estado = "procesando_usuario"
-            threading.Thread(target=self.procesar_charla_worker, args=(texto,), daemon=True).start()
+            threading.Thread(target=self.procesar_charla_worker, args=(texto_limpio,), daemon=True).start()
             
         elif self.chat_estado is None and self.registro_estado is None:
+            # Canalizar conversación independientemente de si hay rostro detectado o conocido
+            nombre = "Extraño"
             if self.cara_detectada_nombre and self.cara_detectada_nombre != "Desconocido":
                 nombre = self.cara_detectada_nombre
-                self.chat_nombre = nombre
-                self.chat_estado = "procesando_usuario"
-                self.historial_conversacion.clear()
                 
-                print(f"[CONVERSACIÓN INICIADA PASIVAMENTE] {nombre} dijo: '{texto}'")
-                self.ultimo_chat_voz[nombre] = time.time()
-                
-                threading.Thread(target=self.procesar_charla_worker, args=(texto,), daemon=True).start()
+            self.chat_nombre = nombre
+            self.chat_estado = "procesando_usuario"
+            self.historial_conversacion.clear()
+            
+            print(f"[CONVERSACIÓN INICIADA] Canalizando texto '{texto_limpio}' hacia la IA para {nombre}...")
+            self.ultimo_chat_voz[nombre] = time.time()
+            
+            threading.Thread(target=self.procesar_charla_worker, args=(texto_limpio,), daemon=True).start()
 
     def solicitar_nombre_popup_worker(self):
         """Diálogo de Tkinter en segundo plano."""
