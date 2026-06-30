@@ -409,8 +409,8 @@ class SistemaReconocimientoFacial:
             dx = der_x - izq_x
             angulo = np.degrees(np.arctan2(dy, dx))
             
-            # Centro de rotación
-            centro = ((izq_x + der_x) // 2, (izq_y + der_y) // 2)
+            # Centro de rotación (OpenCV requiere flotantes en Point2f)
+            centro = (float((izq_x + der_x) / 2.0), float((izq_y + der_y) / 2.0))
             
             # Rotar
             h, w = rostro_gris.shape
