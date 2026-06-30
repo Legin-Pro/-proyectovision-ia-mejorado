@@ -7,6 +7,8 @@ import threading
 import pyttsx3
 import winsound
 import ctypes
+import random
+import requests
 from collections import deque
 import tkinter as tk
 from tkinter import simpledialog
@@ -18,13 +20,46 @@ import speech_recognition as sr
 DATASET_DIR = "dataset"
 TRAINER_FILE = "clasificador.yml"
 ATTENDANCE_FILE = "asistencia.csv"
-HAAR_CASCADE_PATH = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+HAAR_FRONTAL_PATH = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+HAAR_PROFILE_PATH = cv2.data.haarcascades + 'haarcascade_profileface.xml'
 WIDTH_RESIZE = 150
 HEIGHT_RESIZE = 150
 
 # Asegurar que las carpetas base existan
 if not os.path.exists(DATASET_DIR):
     os.makedirs(DATASET_DIR)
+
+# =====================================================================
+# DICCIONARIOS DE FRASES HUMANIZADAS LOCALES (FALLBACK)
+# =====================================================================
+FRASES_SALUDOS_CONOCIDOS = [
+    "¡Hola [nombre]! Qué bueno verte por aquí.",
+    "Hola [nombre], ¿cómo va tu día?",
+    "Qué tal [nombre], un placer saludarte de nuevo.",
+    "Hola de nuevo, [nombre]. Te veo genial hoy.",
+    "¡Hola [nombre]! Acceso verificado."
+]
+
+FRASES_SALUDOS_NUEVOS = [
+    "¡Hola! Oye, estaba revisando y no te tengo en mi base de datos. ¿Cómo te llamas?",
+    "Hola. Qué curioso, no te reconozco. ¿Me dirías tu nombre por favor?",
+    "¡Qué tal! Veo una cara nueva. ¿Cuál es tu nombre?",
+    "Hola, no te tengo registrado todavía. ¿Cómo te llamas?"
+]
+
+FRASES_DURANTE_REGISTRO = [
+    "¡Qué bien, [nombre]! Un gusto conocerte. Quédate ahí charlando conmigo mientras configuro tu perfil.",
+    "Un placer, [nombre]. Solo quédate ahí un momento, estoy analizando tus ángulos en segundo plano.",
+    "Estupendo, [nombre]. Háblame un poco o muévete despacio, estoy registrando tus facciones.",
+    "Excelente, [nombre]. Ya tengo tu nombre. Sigue mirándome un momento."
+]
+
+FRASES_REGISTRO_COMPLETO = [
+    "¡Todo listo! Ya registré tu rostro en mi base de datos. Un placer conocerte, [nombre].",
+    "Perfecto, [nombre]. Configuración terminada. Ya sé quién eres.",
+    "Listo, [nombre]. Registro completado con éxito. Ahora ya te reconozco.",
+    "Hecho, [nombre]. He asimilado tus firmas faciales."
+]
 
 # Hilo para la reproducción de voz (evita que el bucle de video se congele)
 voz_lock = threading.Lock()
@@ -39,7 +74,7 @@ def hablar_worker():
             if "spanish" in voice.name.lower() or "es" in voice.id.lower():
                 engine.setProperty('voice', voice.id)
                 break
-        engine.setProperty('rate', 165)
+        engine.setProperty('rate', 160)
     except Exception as e:
         print(f"[Voz Error] No se pudo inicializar el motor de voz: {e}")
         return
@@ -67,14 +102,18 @@ def encolar_saludo(texto):
 
 
 # =====================================================================
-# CLASE PRINCIPAL: RECONOCEDOR FACIAL INTELIGENTE AUTÓNOMO
+# CLASE PRINCIPAL: RECONOCEDOR FACIAL INTELIGENTE CON APRENDIZAJE PASIVO Y LLM
 # =====================================================================
 class SistemaReconocimientoFacial:
     def __init__(self):
-        # Cargar clasificador de rostros (Haar Cascade)
-        if not os.path.exists(HAAR_CASCADE_PATH):
-            raise FileNotFoundError(f"No se encontró Haar Cascade en {HAAR_CASCADE_PATH}")
-        self.face_cascade = cv2.CascadeClassifier(HAAR_CASCADE_PATH)
+        # Cargar clasificadores (Frontal y Perfil)
+        if not os.path.exists(HAAR_FRONTAL_PATH):
+            raise FileNotFoundError(f"No se encontró Haar Cascade Frontal en {HAAR_FRONTAL_PATH}")
+        if not os.path.exists(HAAR_PROFILE_PATH):
+            raise FileNotFoundError(f"No se encontró Haar Cascade Perfil en {HAAR_PROFILE_PATH}")
+            
+        self.face_cascade = cv2.CascadeClassifier(HAAR_FRONTAL_PATH)
+        self.profile_cascade = cv2.CascadeClassifier(HAAR_PROFILE_PATH)
         
         # Inicializar el reconocedor LBPH de OpenCV
         self.recognizer = cv2.face.LBPHFaceRecognizer_create()
@@ -82,27 +121,112 @@ class SistemaReconocimientoFacial:
         self.nombres_usuarios = {}
         self.cargar_modelo()
         
-        # Ecualizador de contraste adaptable (CLAHE) para optimizar detección en condiciones variables
+        # Leer clave API de Groq del archivo local .env
+        self.groq_key = self.cargar_groq_key()
+        
+        # Ecualizador de contraste adaptable (CLAHE) para optimizar detección lejana
         self.clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         
-        # Historial de detecciones para estabilizar predicciones (Evita parpadeos)
+        # Historial de detecciones para estabilizar predicciones
         self.memoria_deteccion = deque(maxlen=7)
         
+        # --- SEGUIDOR POR CENTROIDES (ID TEMPORAL) ---
+        self.ultimo_centroide = None  # (cx, cy)
+        
         # --- MÁQUINA DE ESTADOS PARA EL REGISTRO DE VOZ (ALEXA STYLE) ---
-        # Estados: None (escaneo normal), "preguntando", "escuchando", "procesando_voz",
-        #          "esperando_popup", "aviso_frente", "capturando_frente",
-        #          "aviso_izquierda", "capturando_izquierda", "aviso_derecha", "capturando_derecha"
         self.registro_estado = None
         self.registro_nombre = ""
         self.registro_timer = 0
-        self.registro_capturas = 0
+        
+        # Conteo de fotos por categorías de pose para evitar saturación
+        self.registro_fotos_front = 0
+        self.registro_fotos_profile = 0
+        self.registro_fotos_dist = 0
         
         # Variables de control de hilos de voz e inputs
-        self.voz_hilo_activo = False
         self.input_nombre_resultado = None
         self.consecutivos_desconocidos = 0
         self.fotos_auto_guardadas = 0
+        
+        # Cooldown temporal de registros en CSV (15 segundos)
         self.ultimo_registro_asistencia = {}
+        
+        # Cooldown de saludos por voz para evitar repetir saludos al mismo usuario seguido (60 segundos)
+        self.ultimo_saludo_voz = {}
+
+    def cargar_groq_key(self):
+        """Carga la clave API de Groq desde el archivo local .env."""
+        if os.path.exists(".env"):
+            try:
+                with open(".env", "r", encoding="utf-8") as f:
+                    for line in f:
+                        if line.strip().startswith("GROQ_API_KEY="):
+                            key = line.split("GROQ_API_KEY=")[1].strip()
+                            print("[INFO] Clave de API de Groq cargada del archivo local .env")
+                            return key
+            except Exception as e:
+                print(f"[WARN] No se pudo leer .env: {e}")
+        return None
+
+    def generar_frase_llm(self, tipo, nombre=None):
+        """Genera una frase contextual humanizada usando Groq Llama-3 o fallback local."""
+        if not self.groq_key:
+            return self.generar_frase_local(tipo, nombre)
+            
+        if tipo == "saludo_conocido":
+            prompt = f"Genera un saludo muy corto (máximo 12 palabras) en español para un usuario conocido llamado {nombre}. Suena humano, inteligente y empático."
+        elif tipo == "saludo_nuevo":
+            prompt = "Genera una frase muy corta (máximo 12 palabras) en español para decirle a un extraño que es una cara nueva y preguntarle su nombre de forma casual."
+        elif tipo == "durante_registro":
+            prompt = f"Genera una frase muy corta (máximo 12 palabras) en español para decirle a {nombre} que te alegra conocerle y que continúe mirándote un momento mientras analizas sus rasgos."
+        elif tipo == "registro_completo":
+            prompt = f"Genera una frase de bienvenida muy corta (máximo 12 palabras) en español para decirle a {nombre} que el registro terminó con éxito y ya lo tienes registrado."
+        else:
+            return self.generar_frase_local(tipo, nombre)
+
+        try:
+            url = "https://api.groq.com/openai/v1/chat/completions"
+            headers = {
+                "Authorization": f"Bearer {self.groq_key}",
+                "Content-Type": "application/json"
+            }
+            data = {
+                "model": "llama3-8b-8192",
+                "messages": [
+                    {"role": "system", "content": "Eres un asistente de visión artificial empático, inteligente y muy amigable. Responde SIEMPRE en español, con frases de máximo 12 palabras, muy humanas y naturales. No uses markdown, comillas ni signos extraños."},
+                    {"role": "user", "content": prompt}
+                ],
+                "max_tokens": 40,
+                "temperature": 0.7
+            }
+            res = requests.post(url, headers=headers, json=data, timeout=1.5)
+            if res.status_code == 200:
+                result = res.json()
+                frase = result["choices"][0]["message"]["content"].strip().replace('"', '')
+                return frase
+        except Exception as e:
+            print(f"[Groq LLM Error] Fallback local activo: {e}")
+            
+        return self.generar_frase_local(tipo, nombre)
+
+    def encolar_saludo_groq(self, tipo, nombre=None):
+        """Genera y encola un saludo usando Groq de forma asíncrona para no congelar el video."""
+        def run():
+            frase = self.generar_frase_llm(tipo, nombre)
+            encolar_saludo(frase)
+        threading.Thread(target=run, daemon=True).start()
+
+    def generar_frase_local(self, tipo, nombre=None):
+        """Generador local aleatorio de reserva."""
+        if tipo == "saludo_conocido":
+            return random.choice(FRASES_SALUDOS_CONOCIDOS).replace("[nombre]", nombre)
+        elif tipo == "saludo_nuevo":
+            return random.choice(FRASES_SALUDOS_NUEVOS)
+        elif tipo == "durante_registro":
+            return random.choice(FRASES_DURANTE_REGISTRO).replace("[nombre]", nombre)
+        elif tipo == "registro_completo":
+            return random.choice(FRASES_REGISTRO_COMPLETO).replace("[nombre]", nombre)
+        return ""
 
     def cargar_modelo(self):
         """Carga el clasificador LBPH y el mapeo de IDs de usuarios."""
@@ -174,7 +298,7 @@ class SistemaReconocimientoFacial:
         hilo.start()
 
     def grabar_audio_mci_worker(self):
-        """Graba en segundo plano para no congelar el bucle de video en la pantalla."""
+        """Graba audio del micrófono en segundo plano."""
         winmm = ctypes.windll.winmm
         wav_path = "registro_voz_temp.wav"
         
@@ -182,14 +306,12 @@ class SistemaReconocimientoFacial:
         winmm.mciSendStringW("open new type waveaudio alias recsound", None, 0, 0)
         winmm.mciSendStringW("record recsound", None, 0, 0)
         
-        # Graba por 4 segundos
         time.sleep(4.0)
         
         winmm.mciSendStringW("stop recsound", None, 0, 0)
         winmm.mciSendStringW(f"save recsound {wav_path}", None, 0, 0)
         winmm.mciSendStringW("close recsound", None, 0, 0)
         
-        # Procesar audio usando SpeechRecognition
         r = sr.Recognizer()
         nombre_transcrito = None
         if os.path.exists(wav_path):
@@ -201,25 +323,23 @@ class SistemaReconocimientoFacial:
                     
                     palabras = transcripcion.strip().split()
                     if palabras:
-                        # Limpiar saludos usuales
                         if len(palabras) >= 3 and palabras[0].lower() in ["me", "mi"] and palabras[1].lower() in ["llamo", "nombre"]:
                             nombre_transcrito = palabras[2]
                         else:
                             nombre_transcrito = palabras[0]
             except Exception as e:
-                print(f"[Voz Error] No se entendió: {e}")
+                print(f"[Voz Error] {e}")
             finally:
                 try:
                     os.remove(wav_path)
                 except:
                     pass
         
-        # Devolver el resultado a la máquina de estados principal
         self.input_nombre_resultado = nombre_transcrito
         self.registro_estado = "procesando_voz"
 
     def solicitar_nombre_popup_worker(self):
-        """Abre el diálogo Tkinter en un hilo separado para que el video continúe actualizándose."""
+        """Diálogo de Tkinter en segundo plano."""
         root = tk.Tk()
         root.withdraw()
         root.attributes("-topmost", True)
@@ -233,14 +353,13 @@ class SistemaReconocimientoFacial:
         self.registro_estado = "procesando_voz"
 
     def iniciar_registro_autonomo(self):
-        """Inicia el estado de registro guiado."""
+        """Inicia el estado de registro guiado de forma humanizada llamando a Groq."""
         self.registro_estado = "preguntando"
         self.registro_timer = time.time()
-        encolar_saludo("Hola, detecto que eres alguien nuevo. ¿Cómo te llamas? Por favor, dime tu nombre después del tono.")
-        print("[AUTO-REGISTRO] Iniciando secuencia de voz...")
+        self.encolar_saludo_groq("saludo_nuevo")
 
     def guardar_asistencia(self, nombre, confianza):
-        """Registra la asistencia en un archivo CSV aplicando cooldown temporal."""
+        """Registra la asistencia en un archivo CSV aplicando cooldown."""
         ahora = time.time()
         if nombre in self.ultimo_registro_asistencia:
             if ahora - self.ultimo_registro_asistencia[nombre] < 15:
@@ -263,14 +382,13 @@ class SistemaReconocimientoFacial:
 
     def auto_capturar_rostro_interaccion(self, nombre, rostro_gris, w_face):
         """
-        Captura rostros automáticamente clasificándolos por distancias para evitar saturar el disco.
-        Guarda un máximo de 5 fotos para Cerca, 5 para Medio y 5 para Lejos (Máximo 15 fotos interactivos).
+        Muestreo selectivo interactivo para asimilar variaciones de distancia.
+        Máximo 5 fotos por categoría (Cerca/Medio/Lejos) para evitar saturar el disco.
         """
         ruta_usuario = os.path.join(DATASET_DIR, nombre)
         if not os.path.exists(ruta_usuario):
             return
             
-        # Determinar categoría de distancia
         if w_face >= 120:
             distancia_tag = "cerca"
         elif w_face >= 60:
@@ -278,25 +396,67 @@ class SistemaReconocimientoFacial:
         else:
             distancia_tag = "lejos"
             
-        # Contar archivos de esta categoría en la carpeta
         archivos_categoria = [f for f in os.listdir(ruta_usuario) if f.startswith(f"{nombre}_auto_{distancia_tag}_")]
         if len(archivos_categoria) >= 5:
-            return  # Ya tenemos suficientes muestras de esta distancia. Evitamos saturación.
+            return
             
-        # Guardar muestra
         rostro_red = cv2.resize(rostro_gris, (WIDTH_RESIZE, HEIGHT_RESIZE), interpolation=cv2.INTER_CUBIC)
         index = len(archivos_categoria)
         archivo_nombre = f"{nombre}_auto_{distancia_tag}_{index}.jpg"
         cv2.imwrite(os.path.join(ruta_usuario, archivo_nombre), rostro_red)
         
         self.fotos_auto_guardadas += 1
-        print(f"[APRENDIZAJE ONLINE] Guardada cara '{nombre}' en rango [{distancia_tag.upper()}] ({index + 1}/5)")
+        print(f"[APRENDIZAJE ONLINE] Captura selectiva en [{distancia_tag.upper()}] ({index + 1}/5) para '{nombre}'")
         
-        # Reentrenar cuando se acumulen 10 fotos nuevas globalmente en segundo plano
         if self.fotos_auto_guardadas >= 10:
             self.fotos_auto_guardadas = 0
-            print("[APRENDIZAJE ONLINE] Retrenando clasificador en segundo plano para asimilar nuevos ángulos...")
             self.entrenar_en_segundo_plano()
+
+    def procesar_captura_pasiva(self, rostro_gris, w_face, es_frontal):
+        """
+        Guarda silenciosa e implícitamente las caras en diferentes poses y distancias
+        durante el proceso de registro activo (Alexa Style) sin interrumpir el video.
+        """
+        ruta_usuario = os.path.join(DATASET_DIR, self.registro_nombre)
+        if not os.path.exists(ruta_usuario):
+            os.makedirs(ruta_usuario)
+            
+        rostro_red = cv2.resize(rostro_gris, (WIDTH_RESIZE, HEIGHT_RESIZE), interpolation=cv2.INTER_CUBIC)
+        
+        # Categorizar por distancia
+        if w_face >= 120:
+            dist_tag = "cerca"
+        elif w_face >= 60:
+            dist_tag = "medio"
+        else:
+            dist_tag = "lejos"
+            
+        # 1. Si la pose es frontal, guardarla en "front"
+        if es_frontal and self.registro_fotos_front < 3:
+            archivo = os.path.join(ruta_usuario, f"{self.registro_nombre}_front_{self.registro_fotos_front}.jpg")
+            cv2.imwrite(archivo, rostro_red)
+            self.registro_fotos_front += 1
+            print(f"[REGISTRO PASIVO] Foto Frontal Guardada ({self.registro_fotos_front}/3)")
+            time.sleep(0.15)
+            
+        # 2. Si la pose es perfil, guardarla en "profile"
+        elif not es_frontal and self.registro_fotos_profile < 3:
+            archivo = os.path.join(ruta_usuario, f"{self.registro_nombre}_profile_{self.registro_fotos_profile}.jpg")
+            cv2.imwrite(archivo, rostro_red)
+            self.registro_fotos_profile += 1
+            print(f"[REGISTRO PASIVO] Foto Perfil Guardada ({self.registro_fotos_profile}/3)")
+            time.sleep(0.15)
+            
+        # 3. Guardar por variación de distancia en "dist"
+        else:
+            fotos_dist = [f for f in os.listdir(ruta_usuario) if f.startswith(f"{self.registro_nombre}_dist_{dist_tag}_")]
+            if len(fotos_dist) < 3 and self.registro_fotos_dist < 3:
+                index = len(fotos_dist)
+                archivo = os.path.join(ruta_usuario, f"{self.registro_nombre}_dist_{dist_tag}_{index}.jpg")
+                cv2.imwrite(archivo, rostro_red)
+                self.registro_fotos_dist += 1
+                print(f"[REGISTRO PASIVO] Foto Distancia [{dist_tag.upper()}] Guardada ({self.registro_fotos_dist}/3)")
+                time.sleep(0.15)
 
     def dibujar_hud_futurista(self, frame, x, y, w, h, etiqueta, subtitulo, color):
         """Dibuja brackets esquineros, barra de fondo y escáner sobre el rostro."""
@@ -346,10 +506,10 @@ class SistemaReconocimientoFacial:
         ultimo_guardado_interactivo = 0
         
         print("\nSISTEMA INTELIGENTE DE RECONOCIMIENTO FACIAL INICIADO.")
-        print("Modo Autónomo e Interactivo:")
-        print("  - Detección lejana mejorada mediante ecualización adaptativa CLAHE.")
-        print("  - Auto-registro guiado por voz (Alexa Style) sin cerrar la cámara.")
-        print("  - Muestreo selectivo inteligente por rango de distancias (evita saturar).")
+        print("Modo Autónomo e Interactivo Humano:")
+        print("  - Auto-registro conversacional asíncrono LLM (Alexa Style) con Groq.")
+        print("  - Detección de pose implícita y seguimiento por centroides (cero órdenes).")
+        print("  - Muestreo pasivo selectivo para máxima precisión sin saturar.")
         print("  - Presione 'Q' en la pantalla del video para salir.")
         print("-" * 60)
         
@@ -371,31 +531,37 @@ class SistemaReconocimientoFacial:
             frame_pequeno = cv2.resize(frame, (ancho_red, alto_red))
             
             gris = cv2.cvtColor(frame_pequeno, cv2.COLOR_BGR2GRAY)
-            
-            # CLAHE ecualización de contraste para capturar rostros lejanos/oscuros
             gris_opt = self.clahe.apply(gris)
             
-            # Detección ultra-sensible (scaleFactor=1.08, minSize=20x20)
-            caras = self.face_cascade.detectMultiScale(
+            # Detectores de Rostros (Frontal y Perfil)
+            caras_frontales = self.face_cascade.detectMultiScale(
                 gris_opt, 
                 scaleFactor=1.08, 
                 minNeighbors=4, 
                 minSize=(20, 20)
             )
             
+            caras_perfil = []
+            if len(caras_frontales) == 0:
+                caras_perfil = self.profile_cascade.detectMultiScale(
+                    gris_opt,
+                    scaleFactor=1.08,
+                    minNeighbors=4,
+                    minSize=(20, 20)
+                )
+            
             # --- ACTUALIZAR MÁQUINA DE ESTADOS DE REGISTRO (ALEXA STYLE) ---
             ahora = time.time()
-            hud_color_global = (0, 255, 0)  # Verde normal
-            hud_texto_global = f"IA: ESCANEO ACTIVO | FPS: {fps:.1f} | REGISTRADOS: {len(self.nombres_usuarios)}"
+            hud_color_global = (0, 255, 0)
+            hud_texto_global = f"ASISTENTE: ESCANEANDO... | FPS: {fps:.1f} | REGISTRADOS: {len(self.nombres_usuarios)}"
             
             if self.registro_estado is not None:
-                hud_color_global = (0, 165, 255)  # Naranja
+                hud_color_global = (0, 165, 255)
                 
-                # Estado 1: Esperando que termine el mensaje por voz
+                # Estado 1: Esperando mensaje vocal inicial
                 if self.registro_estado == "preguntando":
-                    hud_texto_global = "ALEXA IA: PREGUNTANDO NOMBRE..."
-                    if ahora - self.registro_timer > 5.5:  # Termina de hablar
-                        # Emitir Beep y lanzar hilo de grabación MCI
+                    hud_texto_global = "ASISTENTE: PREGUNTANDO NOMBRE..."
+                    if ahora - self.registro_timer > 6.0:
                         try:
                             winsound.Beep(1000, 300)
                         except:
@@ -405,149 +571,113 @@ class SistemaReconocimientoFacial:
                         self.input_nombre_resultado = None
                         threading.Thread(target=self.grabar_audio_mci_worker, daemon=True).start()
                 
-                # Estado 2: Grabando audio del micrófono en segundo plano
+                # Estado 2: Escuchando micrófono en hilo paralelo
                 elif self.registro_estado == "escuchando":
-                    hud_texto_global = "ALEXA IA: ESCUCHANDO NOMBRE... [HABLE AHORA]"
-                    # Dibujar un icono de "Grabando/Micrófono" en pantalla
+                    hud_texto_global = "ASISTENTE: ESCUCHANDO NOMBRE... [HABLE AHORA]"
                     cv2.circle(frame_original, (w_orig - 30, 25), 10, (0, 0, 255), -1)
                 
-                # Estado 3: Procesando la voz y traduciendo a texto
+                # Estado 3: Procesando respuesta de voz
                 elif self.registro_estado == "procesando_voz":
-                    hud_texto_global = "ALEXA IA: PROCESANDO VOZ..."
+                    hud_texto_global = "ASISTENTE: PROCESANDO VOZ..."
                     if self.input_nombre_resultado is not None:
-                        if self.input_nombre_resultado != "":  # Nombre obtenido correctamente
+                        if self.input_nombre_resultado != "":
                             self.registro_nombre = self.input_nombre_resultado
-                            self.registro_estado = "aviso_frente"
+                            self.registro_estado = "capturando_dinamico"
                             self.registro_timer = ahora
-                            encolar_saludo(f"Perfecto {self.registro_nombre}. Mírame de frente por favor.")
+                            self.registro_fotos_front = 0
+                            self.registro_fotos_profile = 0
+                            self.registro_fotos_dist = 0
+                            
+                            # Conversación amigable e implícita de registro con Groq
+                            self.encolar_saludo_groq("durante_registro", self.registro_nombre)
+                            print(f"[AUTO-REGISTRO] Asistente iniciado para '{self.registro_nombre}'")
                         else:
-                            # Falla de voz, activar diálogo de texto no bloqueante
+                            # Falla de voz, abrir pop-up en hilo paralelo
                             self.registro_estado = "esperando_popup"
                             self.input_nombre_resultado = None
                             encolar_saludo("No te escuché bien. Por favor escribe tu nombre en la ventana emergente.")
                             threading.Thread(target=self.solicitar_nombre_popup_worker, daemon=True).start()
                 
-                # Estado 4: Esperando diálogo de texto en segundo plano
+                # Estado 4: Esperando diálogo Tkinter
                 elif self.registro_estado == "esperando_popup":
-                    hud_texto_global = "ALEXA IA: ESPERANDO NOMBRE EN POPUP..."
+                    hud_texto_global = "ASISTENTE: ESPERANDO NOMBRE EN POPUP..."
                 
-                # Estado 5: Guiar postura frontal
-                elif self.registro_estado == "aviso_frente":
-                    hud_texto_global = f"REGISTRO: MÍRAME DE FRENTE ({3 - int(ahora - self.registro_timer)}s)"
-                    if ahora - self.registro_timer > 3.0:
-                        self.registro_estado = "capturando_frente"
-                        self.registro_capturas = 0
+                # Estado 5: Registro Pasivo Dinámico (Auto-Entrenamiento sin órdenes)
+                elif self.registro_estado == "capturando_dinamico":
+                    total_capturas = self.registro_fotos_front + self.registro_fotos_profile + self.registro_fotos_dist
+                    hud_texto_global = f"REGISTRO ACTIVO: {self.registro_nombre.upper()} | CAPTURAS: {total_capturas}/9"
+                    
+                    if self.registro_fotos_front >= 3 and self.registro_fotos_profile >= 3 and self.registro_fotos_dist >= 3:
+                        self.entrenar_en_segundo_plano()
+                        self.encolar_saludo_groq("registro_completo", self.registro_nombre)
                         
-                # Estado 6: Guardar fotos frontales
-                elif self.registro_estado == "capturando_frente":
-                    hud_texto_global = f"REGISTRO: CAPTURANDO FRENTE... [{self.registro_capturas}/3]"
-                    if len(caras) > 0 and self.registro_capturas < 3:
-                        x_peq, y_peq, w_peq, h_peq = caras[0]
-                        rostro_crop = gris_opt[y_peq:y_peq+h_peq, x_peq:x_peq+w_peq]
-                        rostro_red = cv2.resize(rostro_crop, (WIDTH_RESIZE, HEIGHT_RESIZE), interpolation=cv2.INTER_CUBIC)
-                        
-                        ruta_usr = os.path.join(DATASET_DIR, self.registro_nombre)
-                        if not os.path.exists(ruta_usr):
-                            os.makedirs(ruta_usr)
-                        cv2.imwrite(os.path.join(ruta_usr, f"{self.registro_nombre}_front_{self.registro_capturas}.jpg"), rostro_red)
-                        self.registro_capturas += 1
-                        time.sleep(0.15)
-                    elif self.registro_capturas >= 3:
-                        self.registro_estado = "aviso_izquierda"
-                        self.registro_timer = ahora
-                        encolar_saludo("Bien. Ahora gira tu cabeza a la izquierda.")
-
-                # Estado 7: Guiar postura izquierda
-                elif self.registro_estado == "aviso_izquierda":
-                    hud_texto_global = f"REGISTRO: GIRA A LA IZQUIERDA ({3 - int(ahora - self.registro_timer)}s)"
-                    if ahora - self.registro_timer > 3.0:
-                        self.registro_estado = "capturando_izquierda"
-                        self.registro_capturas = 0
-                        
-                # Estado 8: Guardar fotos perfil izquierdo
-                elif self.registro_estado == "capturando_izquierda":
-                    hud_texto_global = f"REGISTRO: CAPTURANDO PERFIL IZQ... [{self.registro_capturas}/3]"
-                    if len(caras) > 0 and self.registro_capturas < 3:
-                        x_peq, y_peq, w_peq, h_peq = caras[0]
-                        rostro_crop = gris_opt[y_peq:y_peq+h_peq, x_peq:x_peq+w_peq]
-                        rostro_red = cv2.resize(rostro_crop, (WIDTH_RESIZE, HEIGHT_RESIZE), interpolation=cv2.INTER_CUBIC)
-                        
-                        ruta_usr = os.path.join(DATASET_DIR, self.registro_nombre)
-                        cv2.imwrite(os.path.join(ruta_usr, f"{self.registro_nombre}_left_{self.registro_capturas}.jpg"), rostro_red)
-                        self.registro_capturas += 1
-                        time.sleep(0.15)
-                    elif self.registro_capturas >= 3:
-                        self.registro_estado = "aviso_derecha"
-                        self.registro_timer = ahora
-                        encolar_saludo("Por último, gira tu cabeza a la derecha.")
-
-                # Estado 9: Guiar postura derecha
-                elif self.registro_estado == "aviso_derecha":
-                    hud_texto_global = f"REGISTRO: GIRA A LA DERECHA ({3 - int(ahora - self.registro_timer)}s)"
-                    if ahora - self.registro_timer > 3.0:
-                        self.registro_estado = "capturando_derecha"
-                        self.registro_capturas = 0
-                        
-                # Estado 10: Guardar fotos perfil derecho
-                elif self.registro_estado == "capturando_derecha":
-                    hud_texto_global = f"REGISTRO: CAPTURANDO PERFIL DER... [{self.registro_capturas}/3]"
-                    if len(caras) > 0 and self.registro_capturas < 3:
-                        x_peq, y_peq, w_peq, h_peq = caras[0]
-                        rostro_crop = gris_opt[y_peq:y_peq+h_peq, x_peq:x_peq+w_peq]
-                        rostro_red = cv2.resize(rostro_crop, (WIDTH_RESIZE, HEIGHT_RESIZE), interpolation=cv2.INTER_CUBIC)
-                        
-                        ruta_usr = os.path.join(DATASET_DIR, self.registro_nombre)
-                        cv2.imwrite(os.path.join(ruta_usr, f"{self.registro_nombre}_right_{self.registro_capturas}.jpg"), rostro_red)
-                        self.registro_capturas += 1
-                        time.sleep(0.15)
-                    elif self.registro_capturas >= 3:
-                        # Guardado final y entrenamiento express
-                        self.entrenar_modelo()
-                        encolar_saludo(f"Registro completado. Bienvenido al sistema, {self.registro_nombre}.")
+                        self.consecutivos_desconocidos = 0
+                        self.memoria_deteccion.clear()
+                        self.registro_estado = None
+                    elif ahora - self.registro_timer > 20.0:
+                        self.entrenar_en_segundo_plano()
+                        encolar_saludo(f"Perfecto {self.registro_nombre}, he completado tu registro.")
                         self.consecutivos_desconocidos = 0
                         self.memoria_deteccion.clear()
                         self.registro_estado = None
 
-            # Pintar barra superior global de estadísticas
+            # Pintar barra superior
             cv2.rectangle(frame_original, (0, 0), (w_orig, 40), (20, 20, 20), -1)
             cv2.line(frame_original, (0, 40), (w_orig, 40), hud_color_global, 1)
             cv2.putText(frame_original, hud_texto_global, (15, 26), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, hud_color_global, 1, cv2.LINE_AA)
             
-            # Cartel informativo si no hay usuarios
+            # Cartel informativo inicial
             if len(self.nombres_usuarios) == 0 and self.registro_estado is None:
                 cv2.rectangle(frame_original, (80, 200), (w_orig - 80, 280), (0, 0, 150), -1)
                 cv2.rectangle(frame_original, (80, 200), (w_orig - 80, 280), (0, 165, 255), 2)
                 cv2.putText(frame_original, "MODO APRENDIZAJE INICIAL", (115, 230),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-                cv2.putText(frame_original, "Párate frente a la cámara para auto-registrarte", (95, 260),
+                cv2.putText(frame_original, "Párate frente a la cámara para iniciar auto-registro por voz", (95, 260),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
+
+            # Consolidar caras
+            caras_combinadas = []
+            for (xf, yf, wf, hf) in caras_frontales:
+                caras_combinadas.append((xf, yf, wf, hf, True))
+            for (xp, yp, wp, hp) in caras_perfil:
+                caras_combinadas.append((xp, yp, wp, hp, False))
             
-            cara_detectada_este_frame = len(caras) > 0
+            cara_detectada_este_frame = len(caras_combinadas) > 0
             
             # --- PROCESAR ROSTROS DETECTADOS ---
-            for (x_peq, y_peq, w_peq, h_peq) in caras:
+            for (x_peq, y_peq, w_peq, h_peq, es_frontal) in caras_combinadas:
                 x = x_peq * escala
                 y = y_peq * escala
                 w = w_peq * escala
                 h = h_peq * escala
                 
+                cx = x + w // 2
+                cy = y + h // 2
+                
+                # Seguimiento por centroides
+                es_mismo_rostro = False
+                if self.ultimo_centroide is not None:
+                    dist_centroides = np.sqrt((cx - self.ultimo_centroide[0])**2 + (cy - self.ultimo_centroide[1])**2)
+                    if dist_centroides < 85:
+                        es_mismo_rostro = True
+                
+                self.ultimo_centroide = (cx, cy)
+                
                 etiqueta = "Analizando..."
-                subtitulo = "Leyendo rostro..."
+                subtitulo = "Estimando pose..."
                 color = (0, 255, 255)
                 
                 cara_gris_recortada = gris_opt[y_peq:y_peq+h_peq, x_peq:x_peq+w_peq]
                 
-                # Solo clasificar si no estamos en medio de un registro activo
+                # 1. Modo Normal
                 if self.registro_estado is None:
                     if self.modelo_cargado:
                         try:
-                            # Escalado bicúbico para máxima definición de rostros pequeños/lejanos
                             cara_gris_norm = cv2.resize(cara_gris_recortada, (WIDTH_RESIZE, HEIGHT_RESIZE), interpolation=cv2.INTER_CUBIC)
                             id_prediccion, distancia = self.recognizer.predict(cara_gris_norm)
                             confianza_pct = max(0, 100 - distancia)
                             
-                            # Umbral flexible optimizado para distancias
                             if confianza_pct > 38:
                                 nombre_detectado = self.nombres_usuarios.get(id_prediccion, "Desconocido")
                                 self.memoria_deteccion.append(nombre_detectado)
@@ -561,16 +691,20 @@ class SistemaReconocimientoFacial:
                                 
                             if voto_ganador != "Desconocido":
                                 etiqueta = f"ACTIVO: {voto_ganador.upper()}"
-                                subtitulo = f"Match: {confianza_pct:.1f}%"
-                                color = (0, 255, 0)  # Verde
+                                subtitulo = f"Match: {confianza_pct:.1f}% ({'Frente' if es_frontal else 'Perfil'})"
+                                color = (0, 255, 0)
                                 
                                 self.consecutivos_desconocidos = 0
                                 
-                                # Saludar y guardar asistencia
-                                encolar_saludo(f"Hola {voto_ganador}, bienvenido.")
+                                # Saludo casual asíncrono con Cooldown (60 segundos por usuario)
+                                ahora_saludo = time.time()
+                                if ahora_saludo - self.ultimo_saludo_voz.get(voto_ganador, 0) > 60.0:
+                                    self.ultimo_saludo_voz[voto_ganador] = ahora_saludo
+                                    self.encolar_saludo_groq("saludo_conocido", voto_ganador)
+                                
                                 self.guardar_asistencia(voto_ganador, confianza_pct)
                                 
-                                # Capturar de forma selectiva según distancia (máximo 5 fotos por distancia)
+                                # Captura interactiva selectiva por rangos
                                 ahora_t = time.time()
                                 if ahora_t - ultimo_guardado_interactivo > 3.0:
                                     self.auto_capturar_rostro_interaccion(voto_ganador, cara_gris_recortada, w)
@@ -578,7 +712,7 @@ class SistemaReconocimientoFacial:
                             else:
                                 etiqueta = "DESCONOCIDO"
                                 subtitulo = "Identificando..."
-                                color = (0, 0, 255)  # Rojo
+                                color = (0, 0, 255)
                                 self.consecutivos_desconocidos += 1
                                 
                         except Exception as e:
@@ -586,26 +720,32 @@ class SistemaReconocimientoFacial:
                             color = (0, 0, 255)
                     else:
                         etiqueta = "NUEVA PERSONA"
-                        subtitulo = "Auto-registro por voz..."
+                        subtitulo = "Auto-registro..."
                         color = (0, 165, 255)
                         self.consecutivos_desconocidos += 1
                     
-                    # DISPARAR AUTO-REGISTRO
-                    # Si detecta rostro desconocido durante 45 frames seguidos, inicia máquina de estados de voz
+                    # DISPARAR REGISTRO AUTÓNOMO
                     if self.consecutivos_desconocidos >= 45:
                         self.iniciar_registro_autonomo()
+                
+                # 2. Modo Registro Activo (Auto-Entrenamiento Pasivo)
                 else:
-                    # En modo registro activo, dibujar un HUD de análisis en color naranja sobre las caras
-                    etiqueta = "CONFIGURACIÓN IA"
-                    subtitulo = "Registrando posturas..."
+                    pose_tag = "Frontal" if es_frontal else "Perfil"
+                    etiqueta = f"REGISTRANDO: {self.registro_nombre.upper()}"
+                    subtitulo = f"Pose detectada: {pose_tag.upper()}"
                     color = (0, 165, 255)
+                    
+                    if es_mismo_rostro or self.registro_fotos_front == 0:
+                        self.procesar_captura_pasiva(cara_gris_recortada, w, es_frontal)
                 
                 self.dibujar_hud_futurista(frame_original, x, y, w, h, etiqueta, subtitulo, color)
             
-            # Decrementar contador de desconocidos en ausencia de caras para evitar disparos en falsos positivos rápidos
-            if not cara_detectada_este_frame and self.consecutivos_desconocidos > 0:
-                self.consecutivos_desconocidos -= 1
-                
+            # Resetear centroide
+            if not cara_detectada_este_frame:
+                self.ultimo_centroide = None
+                if self.consecutivos_desconocidos > 0:
+                    self.consecutivos_desconocidos -= 1
+            
             cv2.imshow("Antigravity Smart Recognition HUD", frame_original)
             
             # Medir FPS
@@ -626,7 +766,7 @@ class SistemaReconocimientoFacial:
 # =====================================================================
 if __name__ == "__main__":
     print("=" * 60)
-    print("SISTEMA DE VISIÓN CON IA: AUTO-REGISTRO POR VOZ NATIVO & HUD FLUIDO")
+    print("SISTEMA DE VISIÓN CON IA: AUTO-APRENDIZAJE Y APRENDIZAJE PASIVO CON GROQ LLM")
     print("=" * 60)
     
     try:

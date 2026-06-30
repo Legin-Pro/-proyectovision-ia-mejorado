@@ -21,6 +21,11 @@ dataset/*
 clasificador.yml
 asistencia.csv
 
+# Archivos de configuración local (EXCLUIDOS DE GIT POR SEGURIDAD)
+.env
+*.env
+config.txt
+
 # Editores
 .vscode/
 .idea/
