@@ -895,7 +895,7 @@ class SistemaReconocimientoFacial:
             detections = self.net.forward()
             
             gris = cv2.cvtColor(frame_pequeno, cv2.COLOR_BGR2GRAY)
-            gris_opt = self.clahe.apply(gris)
+            gris_opt = gris  # Usamos gris normal para recortar; CLAHE se aplicará una sola vez en el preprocesamiento de la cara
             
             caras_combinadas = []
             
