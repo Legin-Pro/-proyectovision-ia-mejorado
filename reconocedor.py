@@ -111,6 +111,13 @@ class SistemaReconocimientoFacial:
         self.limpiar_dataset_ruido()
         self.cargar_modelo()
         
+        # Guía de voz proactiva si la base de datos está completamente vacía
+        if len(self.nombres_usuarios) == 0:
+            def anunciar_bienvenida():
+                time.sleep(2.5)  # Esperar a que la calibración de VAD finalice
+                encolar_saludo("Hola, mi base de datos está vacía. Por favor, di tu nombre usando la frase me llamo, o presiona la tecla R para iniciar tu registro.")
+            threading.Thread(target=anunciar_bienvenida, daemon=True).start()
+        
         # Leer clave API de Groq del archivo local .env
         self.groq_key = self.cargar_groq_key()
         
@@ -521,6 +528,9 @@ class SistemaReconocimientoFacial:
         
         try:
             id_mic = self.obtener_mejor_dispositivo_entrada()
+            devices = sd.query_devices()
+            mic_name = devices[id_mic]['name'] if id_mic >= 0 else "Ninguno"
+            print(f"[SISTEMA VOZ] Usando micrófono: ID {id_mic} - {mic_name}")
             with sd.InputStream(device=id_mic, samplerate=sample_rate, channels=1, blocksize=chunk_size) as stream:
                 self.calibrar_microfono(stream, chunk_size)
                 
