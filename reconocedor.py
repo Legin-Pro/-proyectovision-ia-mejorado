@@ -621,6 +621,15 @@ class SistemaReconocimientoFacial:
                     nombre = palabras[0]
             if nombre:
                 nombre = ''.join(c for c in nombre if c.isalnum()).capitalize()
+                
+            # Validar nombre para evitar pronombres o ruidos ("Mi", "Yo", etc.)
+            blacklist_nombres = {"mi", "me", "yo", "el", "la", "tu", "su", "un", "de", "no", "si", "hola", "ok", "nombre", "llamo", "es", "este", "esta"}
+            if not nombre or nombre.lower() in blacklist_nombres or len(nombre) < 3:
+                print(f"[REGISTRO] Nombre inválido o ruido rechazado: '{nombre}'")
+                self.registro_estado = "escuchando"  # Permanecer en escucha
+                encolar_saludo("No logré entender tu nombre claramente. ¿Podrías repetirlo, por favor?")
+                return
+                
             self.input_nombre_resultado = nombre
             self.registro_estado = "procesando_voz"
             return
@@ -636,7 +645,8 @@ class SistemaReconocimientoFacial:
                     break
             if nombre:
                 nombre = ''.join(c for c in nombre if c.isalnum()).capitalize()
-                if len(nombre) >= 2:
+                blacklist_nombres = {"mi", "me", "yo", "el", "la", "tu", "su", "un", "de", "no", "si", "hola", "ok", "nombre", "llamo", "es", "este", "esta"}
+                if nombre.lower() not in blacklist_nombres and len(nombre) >= 3:
                     # Cerrar chat previo si estaba activo
                     self.chat_estado = None
                     self.registro_nombre = nombre
