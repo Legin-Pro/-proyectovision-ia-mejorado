@@ -1054,7 +1054,7 @@ class SistemaReconocimientoFacial:
                             id_prediccion, distancia = self.recognizer.predict(cara_gris_norm)
                             confianza_pct = max(0, 100 - distancia)
                             
-                            if confianza_pct > 38:
+                            if confianza_pct > 48:
                                 nombre_detectado = self.nombres_usuarios.get(id_prediccion, "Desconocido")
                                 self.memoria_deteccion.append(nombre_detectado)
                             else:
