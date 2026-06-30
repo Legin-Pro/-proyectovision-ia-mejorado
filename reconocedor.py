@@ -48,6 +48,7 @@ def hablar_worker():
     pythoncom.CoInitialize()
     try:
         voice = win32com.client.Dispatch("SAPI.SpVoice")
+        voice.Rate = -1  # Ritmo de habla más natural, pausado y humano
         voices = voice.GetVoices()
         for i in range(voices.Count):
             v_desc = voices.Item(i).GetDescription()
@@ -96,12 +97,12 @@ class SistemaReconocimientoFacial:
         # Ecualizador de contraste adaptable (CLAHE) para normalización de iluminación
         self.clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         
-        # Inicializar el reconocedor LBPH de OpenCV con hiperparámetros de máxima resolución
+        # Inicializar el reconocedor LBPH de OpenCV con hiperparámetros optimizados y estables de memoria
         self.recognizer = cv2.face.LBPHFaceRecognizer_create(
-            radius=3,
-            neighbors=16,
-            grid_x=14,
-            grid_y=14
+            radius=1,
+            neighbors=8,
+            grid_x=8,
+            grid_y=8
         )
         
         self.modelo_cargado = False
@@ -140,6 +141,7 @@ class SistemaReconocimientoFacial:
         self.last_mic_rms = 0.0
         self.texto_transcrito_pantalla = ""
         self.texto_timer_pantalla = 0.0
+        self.ultimo_tiempo_foto = 0.0
 
         # --- ESCUCHA CONTINUA EN SEGUNDO PLANO (RAM - CVE 2.0) ---
         self.umbral_silencio = 0.025  # Umbral base por defecto (calibrado en bucle_escucha_continua)
@@ -218,10 +220,10 @@ class SistemaReconocimientoFacial:
             return None
 
     def generar_frase_llm(self, tipo, nombre=None, texto_conversacion=None):
-        """Genera una frase contextual usando Groq Llama-3."""
+        """Genera una frase contextual ingeniosa usando Groq Llama-3 con alta personalidad."""
         if not self.groq_key:
             if tipo == "chat":
-                return "No tengo conexión a internet para charlar en este momento."
+                return "No tengo internet, pero me gusta escucharte de todos modos."
             return self.generar_frase_local(tipo, nombre)
             
         hora_actual = time.strftime("%H:%M")
@@ -230,11 +232,13 @@ class SistemaReconocimientoFacial:
         
         persona = nombre if nombre else "un extraño"
         system_content = (
-            f"Eres Alexa, una inteligencia artificial de visión muy ingeniosa, carismática y simpática en español. "
-            f"Interactúas con {persona}. Datos actuales del entorno: Hora local: {hora_actual}, Fecha: {fecha_actual}, "
-            f"Usuarios registrados en el sistema: {total_usuarios}. "
-            f"Responde SIEMPRE en español, de forma muy amigable, ingeniosa, divertida y extremadamente breve (máximo 15 palabras). "
-            f"Evita respuestas aburridas o predecibles. No uses markdown, asteriscos ni comillas."
+            f"Eres Alexa, una asistente virtual con una personalidad sumamente carismática, alegre, ingeniosa, divertida y muy ocurrente en español. "
+            f"Hablas de forma fluida, cálida y muy natural (como un amigo ocurrente, nunca como un robot rígido). "
+            f"Interactúas con {persona}. Datos del entorno: Hora local: {hora_actual}, Fecha: {fecha_actual}, Usuarios registrados: {total_usuarios}. "
+            f"REGLAS CRÍTICAS:\n"
+            f"1. Responde de forma concisa pero con ritmo natural (entre 10 y 28 palabras). No hables en telegramas de 4 palabras ni frases eternas.\n"
+            f"2. Varía al máximo tus respuestas, evita preguntas o saludos idénticos.\n"
+            f"3. Prohibido usar markdown, asteriscos, comillas o viñetas. Escribe texto plano limpio para que el sintetizador de voz lo lea de forma fluida."
         )
         
         if tipo == "chat" and texto_conversacion:
@@ -243,15 +247,15 @@ class SistemaReconocimientoFacial:
         else:
             if tipo == "saludo_conocido":
                 prompt = (
-                    f"Genera un saludo ocurrente y muy corto (máximo 12 palabras) en español para {nombre}. "
-                    f"Ej: '¡Vaya, al fin apareces {nombre}! Estaba aburriéndome de ver la pared.'"
+                    f"Genera un saludo muy amigable, simpático e ingenioso para {nombre} de máximo 18 palabras. "
+                    f"Evita decir siempre lo mismo, haz un comentario breve sobre el día, el clima o que al fin lo ves por cámara."
                 )
             elif tipo == "saludo_nuevo":
-                prompt = "Dime que no te tengo registrado de una forma divertida e ingeniosa, y pídeme mi nombre (máximo 12 palabras)."
+                prompt = "Dile a la persona en cámara que no la conoces de una forma súper carismática, pidiéndole su nombre en máximo 18 palabras."
             elif tipo == "durante_registro":
-                prompt = f"Dile a {nombre} con entusiasmo que ya sabes su nombre y que se mueva libremente mientras terminas de registrarle (máximo 12 palabras)."
+                prompt = f"Dile a {nombre} de forma divertida y alegre que se mueva ligeramente o sonría mientras guardas sus fotos, máximo 18 palabras."
             elif tipo == "registro_completo":
-                prompt = f"Dile a {nombre} que el registro ha terminado con éxito y haz un comentario gracioso de bienvenida (máximo 12 palabras)."
+                prompt = f"Dale la bienvenida oficial a {nombre} a tu memoria con una frase feliz, ingeniosa y de máximo 18 palabras."
             else:
                 return self.generar_frase_local(tipo, nombre)
                 
@@ -269,8 +273,8 @@ class SistemaReconocimientoFacial:
             data = {
                 "model": "llama3-8b-8192",
                 "messages": messages,
-                "max_tokens": 45,
-                "temperature": 0.85
+                "max_tokens": 100,  # Aumentado para frases completas y fluidas
+                "temperature": 0.95  # Alta temperatura para mayor creatividad y variación léxica
             }
             res = requests.post(url, headers=headers, json=data, timeout=3.5)
             if res.status_code == 200:
@@ -283,7 +287,7 @@ class SistemaReconocimientoFacial:
             print(f"[Groq LLM Error] Fallback local activo: {e}")
             
         if tipo == "chat":
-            return "Interesante. ¿Qué más me cuentas?"
+            return "Comprendo lo que dices. Cuéntame más sobre eso."
         return self.generar_frase_local(tipo, nombre)
 
     def encolar_saludo_groq(self, tipo, nombre=None):
@@ -294,15 +298,33 @@ class SistemaReconocimientoFacial:
         threading.Thread(target=run, daemon=True).start()
 
     def generar_frase_local(self, tipo, nombre=None):
-        """Generador local aleatorio de reserva."""
-        if tipo == "saludo_conocido":
-            return f"Hola {nombre}, bienvenido de nuevo al sistema."
-        elif tipo == "saludo_nuevo":
-            return "Hola, no te tengo en mi base de datos. ¿Cómo te llamas?"
-        elif tipo == "durante_registro":
-            return f"Perfecto {nombre}, quédate ahí quieto un momento mientras te analizo."
-        elif tipo == "registro_completo":
-            return f"Registro completado. Un placer conocerte, {nombre}."
+        """Generador local aleatorio de reserva con variedad de frases."""
+        opciones = {
+            "saludo_conocido": [
+                f"¡Hola {nombre}! Qué alegría volver a verte en pantalla.",
+                f"Vaya, {nombre}, me alegra que pases a saludar hoy.",
+                f"¡Qué tal, {nombre}! Te estaba esperando para charlar.",
+                f"Hola {nombre}, te veo perfectamente. ¿Cómo va tu día?"
+            ],
+            "saludo_nuevo": [
+                "Vaya, una cara nueva por aquí. ¿Cuál es tu nombre, amigo?",
+                "Hola, no reconozco tus facciones todavía. ¿Cómo te llamas?",
+                "¡Hey! No te tengo en mi base de datos. Dime tu nombre para registrarte.",
+                "Hola, ¿quién anda ahí? Dime tu nombre para agregarte."
+            ],
+            "durante_registro": [
+                f"Perfecto {nombre}, muévete un poquito mientras guardo tus fotos.",
+                f"Muy bien {nombre}, te estoy analizando de cerca, sonríe a la cámara.",
+                f"Entendido {nombre}, mira fijamente unos segundos más para entrenar mi red."
+            ],
+            "registro_completo": [
+                f"¡Listo {nombre}! Ya te registré con éxito en mi base de datos.",
+                f"Registro completado {nombre}. Ahora eres parte oficial de mi memoria.",
+                f"Perfecto {nombre}, ya sé quién eres. ¡Bienvenido al sistema!"
+            ]
+        }
+        if tipo in opciones:
+            return random.choice(opciones[tipo])
         return ""
 
     def cargar_modelo(self):
@@ -375,10 +397,10 @@ class SistemaReconocimientoFacial:
             
         try:
             temp_recognizer = cv2.face.LBPHFaceRecognizer_create(
-                radius=3,
-                neighbors=16,
-                grid_x=14,
-                grid_y=14
+                radius=1,
+                neighbors=8,
+                grid_x=8,
+                grid_y=8
             )
             temp_recognizer.train(rostros, np.array(ids))
             temp_recognizer.write(TRAINER_FILE)
@@ -605,6 +627,8 @@ class SistemaReconocimientoFacial:
         """Inicia el estado de registro guiado de forma humanizada llamando a Groq."""
         self.registro_estado = "preguntando"
         self.registro_timer = time.time()
+        self.registro_fotos_guardadas = 0
+        self.input_nombre_resultado = None
         self.encolar_saludo_groq("saludo_nuevo")
 
     def iniciar_charla_conversacional(self, nombre):
@@ -672,7 +696,9 @@ class SistemaReconocimientoFacial:
             
         rostro_opt = self.preprocesar_rostro_extremo(rostro_gris)
         archivo_nombre = f"{nombre}_auto_{total_fotos}.jpg"
-        cv2.imwrite(os.path.join(ruta_usuario, archivo_nombre), rostro_opt)
+        archivo_completo = os.path.join(ruta_usuario, archivo_nombre)
+        # Escribir de forma asíncrona en segundo plano para no congelar el frame
+        threading.Thread(target=cv2.imwrite, args=(archivo_completo, rostro_opt), daemon=True).start()
         
         self.fotos_auto_guardadas += 1
         print(f"[APRENDIZAJE ONLINE] Captura de pose pasiva ({total_fotos + 1}/30) para '{nombre}'")
@@ -682,21 +708,37 @@ class SistemaReconocimientoFacial:
             self.entrenar_en_segundo_plano()
 
     def procesar_captura_pasiva(self, rostro_gris):
-        """Guarda silenciosa e implícitamente las caras aplicando normalización extrema."""
+        """Guarda silenciosa e implícitamente las caras aplicando normalización extrema y asíncrona."""
+        ahora = time.time()
+        # Controlar la velocidad de captura sin congelar el hilo del video (mínimo 250ms entre fotos)
+        if ahora - self.ultimo_tiempo_foto < 0.25:
+            return
+            
+        self.ultimo_tiempo_foto = ahora
+        
         ruta_usuario = os.path.join(DATASET_DIR, self.registro_nombre)
         if not os.path.exists(ruta_usuario):
             os.makedirs(ruta_usuario)
             
         rostro_opt = self.preprocesar_rostro_extremo(rostro_gris)
         
-        # Guardar secuencialmente hasta 15 fotos para registrar todos los ángulos
+        # Limpiar al empezar si es la primera foto del ciclo de registro activo
+        if self.registro_fotos_guardadas == 0:
+            for f in os.listdir(ruta_usuario):
+                if f.endswith(".jpg"):
+                    try:
+                        os.remove(os.path.join(ruta_usuario, f))
+                    except:
+                        pass
+                        
         total_existentes = len([f for f in os.listdir(ruta_usuario) if f.endswith(".jpg")])
         if total_existentes < 15:
             archivo = os.path.join(ruta_usuario, f"{self.registro_nombre}_{total_existentes}.jpg")
-            cv2.imwrite(archivo, rostro_opt)
+            # --- MEJORA RENDIMIENTO: Escritura asíncrona en disco en un hilo daemon ---
+            threading.Thread(target=cv2.imwrite, args=(archivo, rostro_opt), daemon=True).start()
+            
             self.registro_fotos_guardadas = total_existentes + 1
-            print(f"[REGISTRO PASIVO] Foto Guardada ({self.registro_fotos_guardadas}/15)")
-            time.sleep(0.2)  # Retardo para capturar variación natural de poses
+            print(f"[REGISTRO PASIVO] Foto Encolada Asíncronamente ({self.registro_fotos_guardadas}/15)")
 
     def dibujar_hud_futurista(self, frame, x, y, w, h, etiqueta, subtitulo, color):
         """Dibuja brackets esquineros, barra de fondo y escáner sobre el rostro."""
