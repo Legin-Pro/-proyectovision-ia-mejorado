@@ -42,9 +42,85 @@ cola_saludos = deque(maxlen=5)
 # Variable global para saber si el asistente está hablando físicamente
 asistente_hablando = False
 
+def generar_audio_premium(texto, temp_audio, eleven_key=None, gemini_key=None):
+    """Intenta generar audio usando ElevenLabs (1er prioridad) o Gemini Live (2da prioridad), 
+    de lo contrario retorna None para indicar fallback a Edge TTS."""
+    import requests
+    
+    # 1. Prioridad: ElevenLabs (La mejor síntesis de voz del mundo con entonación humana real)
+    if eleven_key:
+        try:
+            # Usamos una voz extremadamente natural en español: Antoni (ID: ErXwobaYiN019PkySvjV)
+            voice_id = "ErXwobaYiN019PkySvjV" 
+            url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+            headers = {
+                "Accept": "audio/mpeg",
+                "Content-Type": "application/json",
+                "xi-api-key": eleven_key
+            }
+            payload = {
+                "text": texto,
+                "model_id": "eleven_multilingual_v2",
+                "voice_settings": {
+                    "stability": 0.40,
+                    "similarity_boost": 0.85,
+                    "style": 0.45,
+                    "use_speaker_boost": True
+                }
+            }
+            res = requests.post(url, json=payload, headers=headers, timeout=10)
+            if res.status_code == 200:
+                with open(temp_audio, "wb") as f:
+                    f.write(res.content)
+                return "elevenlabs"
+            else:
+                print(f"[ElevenLabs Error] HTTP {res.status_code}: {res.text}")
+        except Exception as e:
+            print(f"[ElevenLabs Exception] {e}")
+            
+    # 2. Prioridad: Google Gemini 2.0 Audio (Voces del asistente Gemini Live oficiales: Aoede, Puck, Kore)
+    if gemini_key:
+        try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={gemini_key}"
+            headers = {"Content-Type": "application/json"}
+            payload = {
+                "contents": [{
+                    "parts": [
+                        {"text": f"Lee el siguiente texto exactamente como está escrito, con entonación de asistente conversacional, sin comentarios adicionales: {texto}"}
+                    ]
+                }],
+                "generationConfig": {
+                    "responseModalities": ["AUDIO"],
+                    "speechConfig": {
+                        "voiceConfig": {
+                            "prebuiltVoiceConfig": {
+                                "voiceName": "Aoede" # Aoede, Charon, Fenrir, Kore, Puck
+                            }
+                        }
+                    }
+                }
+            }
+            res = requests.post(url, json=payload, headers=headers, timeout=10)
+            if res.status_code == 200:
+                import base64
+                data = res.json()
+                part = data["candidates"][0]["content"]["parts"][0]
+                if "inlineData" in part:
+                    audio_base64 = part["inlineData"]["data"]
+                    audio_bytes = base64.b64decode(audio_base64)
+                    with open(temp_audio, "wb") as f:
+                        f.write(audio_bytes)
+                    return "gemini"
+            else:
+                print(f"[Gemini TTS Error] HTTP {res.status_code}: {res.text}")
+        except Exception as e:
+            print(f"[Gemini TTS Exception] {e}")
+            
+    return None
+
 def hablar_worker():
-    """Ejecuta en segundo plano la síntesis de voz usando Microsoft Edge Neural TTS (Voz Humana) 
-    con formato SSML expresivo o SAPI5 como fallback local offline."""
+    """Ejecuta en segundo plano la síntesis de voz priorizando ElevenLabs y Gemini Live, 
+    usando Edge Neural TTS como fallback gratuito o SAPI5 como fallback offline."""
     global asistente_hablando
     pythoncom.CoInitialize()
     
@@ -71,41 +147,72 @@ def hablar_worker():
 
     temp_audio = os.path.join(os.path.dirname(os.path.abspath(__file__)), "temp_voz.mp3")
 
+    # Cargar API Keys locales para voz premium desde .env
+    eleven_key = None
+    gemini_key = None
+    if os.path.exists(".env"):
+        try:
+            with open(".env", "r", encoding="utf-8") as f:
+                for line in f:
+                    line_stripped = line.strip()
+                    if line_stripped.startswith("ELEVENLABS_API_KEY="):
+                        eleven_key = line_stripped.split("=")[1].strip()
+                    elif line_stripped.startswith("GEMINI_API_KEY="):
+                        gemini_key = line_stripped.split("=")[1].strip()
+        except:
+            pass
+
+    # Imprimir estado de inicialización de voces
+    if eleven_key:
+        print("[SISTEMA VOZ] Motor premium ElevenLabs listo (Voz Humana ultra-expresiva).")
+    elif gemini_key:
+        print("[SISTEMA VOZ] Motor premium Google Gemini Live listo (Voz oficial de Gemini).")
+    else:
+        print("[SISTEMA VOZ] Motor Microsoft Edge Neural TTS listo (Gratuito y optimizado).")
+
     while True:
         if cola_saludos:
             texto = cola_saludos.popleft()
             with voz_lock:
                 asistente_hablando = True
-                hablado_con_edge = False
+                hablado_con_exito = False
                 
-                # Intentar usar Edge Neural TTS con SSML si edge_tts está instalado
-                try:
-                    import edge_tts
-                    
-                    # Formatear a SSML con prosodia expresiva (pitch y rate ajustados + pausas naturales)
-                    texto_limpio = texto.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-                    texto_pausado = texto_limpio.replace(", ", ", <break time='180ms'/> ")
-                    texto_pausado = texto_pausado.replace(". ", ". <break time='320ms'/> ")
-                    texto_pausado = texto_pausado.replace("? ", "? <break time='350ms'/> ")
-                    texto_pausado = texto_pausado.replace("! ", "! <break time='350ms'/> ")
-                    
-                    ssml_texto = f"""<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='es-MX'>
-                        <voice name='es-MX-DaliaNeural'>
-                            <prosody pitch='+3Hz' rate='+4%' volume='100'>
-                                {texto_pausado}
-                            </prosody>
-                        </voice>
-                    </speak>"""
-                    
-                    # Generar audio asíncronamente
-                    async def generar():
-                        communicate = edge_tts.Communicate(ssml_texto, "es-MX-DaliaNeural")
-                        await communicate.save(temp_audio)
-                    
-                    import asyncio
-                    asyncio.run(generar())
-                    
-                    if player is not None and os.path.exists(temp_audio):
+                # 1. Intentar generar audio premium (ElevenLabs o Gemini) si las llaves existen
+                motor_usado = generar_audio_premium(texto, temp_audio, eleven_key, gemini_key)
+                
+                # 2. Si fallaron o no están configurados, fallback a Edge Neural TTS
+                if not motor_usado:
+                    try:
+                        import edge_tts
+                        
+                        # Formatear a SSML con prosodia expresiva (pitch y rate ajustados + pausas naturales)
+                        texto_limpio = texto.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                        texto_pausado = texto_limpio.replace(", ", ", <break time='180ms'/> ")
+                        texto_pausado = texto_pausado.replace(". ", ". <break time='320ms'/> ")
+                        texto_pausado = texto_pausado.replace("? ", "? <break time='350ms'/> ")
+                        texto_pausado = texto_pausado.replace("! ", "! <break time='350ms'/> ")
+                        
+                        ssml_texto = f"""<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='es-MX'>
+                            <voice name='es-MX-DaliaNeural'>
+                                <prosody pitch='+3Hz' rate='+4%' volume='100'>
+                                    {texto_pausado}
+                                </prosody>
+                            </voice>
+                        </speak>"""
+                        
+                        async def generar():
+                            communicate = edge_tts.Communicate(ssml_texto, "es-MX-DaliaNeural")
+                            await communicate.save(temp_audio)
+                        
+                        import asyncio
+                        asyncio.run(generar())
+                        motor_usado = "edge-tts"
+                    except Exception as e:
+                        pass
+                
+                # 3. Reproducir el archivo generado (Premium o Edge TTS)
+                if motor_usado and player is not None and os.path.exists(temp_audio):
+                    try:
                         player.URL = temp_audio
                         player.controls.play()
                         
@@ -120,13 +227,12 @@ def hablar_worker():
                         time.sleep(0.25)
                         player.URL = ""  # Desvincular el archivo de audio para liberarlo
                         time.sleep(0.1)
-                        hablado_con_edge = True
-                except Exception as e:
-                    # Si falla por internet o librería no instalada, pasará al fallback
-                    pass
+                        hablado_con_exito = True
+                    except Exception as e:
+                        print(f"[Voz Error] Error al reproducir audio generado: {e}")
                 
-                # Fallback a SAPI5 si Edge TTS no funcionó
-                if not hablado_con_edge and sapi_voice is not None:
+                # 4. Fallback a SAPI5 si todo lo anterior falló o está offline
+                if not hablado_con_exito and sapi_voice is not None:
                     try:
                         sapi_voice.Speak(texto, 0)
                     except Exception as e:
