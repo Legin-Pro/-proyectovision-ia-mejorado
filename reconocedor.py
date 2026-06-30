@@ -13,6 +13,7 @@ import win32com.client
 import io
 import wave
 import sounddevice as sd
+import mediapipe as mp
 from collections import deque
 import tkinter as tk
 from tkinter import simpledialog
@@ -24,8 +25,6 @@ import speech_recognition as sr
 DATASET_DIR = "dataset"
 TRAINER_FILE = "clasificador.yml"
 ATTENDANCE_FILE = "asistencia.csv"
-HAAR_FRONTAL_PATH = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
-HAAR_PROFILE_PATH = cv2.data.haarcascades + 'haarcascade_profileface.xml'
 WIDTH_RESIZE = 200  # Resolución ampliada para capturar microfacciones
 HEIGHT_RESIZE = 200
 
@@ -85,19 +84,18 @@ def encolar_saludo(texto):
 # =====================================================================
 class SistemaReconocimientoFacial:
     def __init__(self):
-        # Cargar clasificadores (Frontal y Perfil)
-        if not os.path.exists(HAAR_FRONTAL_PATH):
-            raise FileNotFoundError(f"No se encontró Haar Cascade Frontal en {HAAR_FRONTAL_PATH}")
-        if not os.path.exists(HAAR_PROFILE_PATH):
-            raise FileNotFoundError(f"No se encontró Haar Cascade Perfil en {HAAR_PROFILE_PATH}")
-            
-        self.face_cascade = cv2.CascadeClassifier(HAAR_FRONTAL_PATH)
-        self.profile_cascade = cv2.CascadeClassifier(HAAR_PROFILE_PATH)
+        # --- INTEGRACIÓN DE MEDIAPIPE FACE DETECTION (PRECISIÓN EXTREMA A LARGA DISTANCIA) ---
+        # model_selection=1 configura el modelo de rango completo (óptimo hasta 5 metros)
+        self.mp_face_detection = mp.solutions.face_detection
+        self.face_detector = self.mp_face_detection.FaceDetection(
+            min_detection_confidence=0.55,
+            model_selection=1
+        )
         
         # Ecualizador de contraste adaptable (CLAHE) para normalización de iluminación
         self.clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         
-        # --- CONFIGURACIÓN MÁXIMA DE HISTOGRAMA LBPH (196 SUB-REGIONES) ---
+        # Inicializar el reconocedor LBPH de OpenCV con hiperparámetros de máxima resolución
         self.recognizer = cv2.face.LBPHFaceRecognizer_create(
             radius=3,
             neighbors=16,
@@ -113,7 +111,7 @@ class SistemaReconocimientoFacial:
         # Leer clave API de Groq del archivo local .env
         self.groq_key = self.cargar_groq_key()
         
-        # Historial de detecciones para estabilizar predicciones
+        # Historial de detecciones para la estabilización
         self.memoria_deteccion = deque(maxlen=7)
         self.cara_detectada_nombre = None
         
@@ -125,7 +123,6 @@ class SistemaReconocimientoFacial:
         self.registro_nombre = ""
         self.registro_timer = 0
         
-        # Ampliamos a 15 fotos de alta calidad (5 por categoría)
         self.registro_fotos_front = 0
         self.registro_fotos_profile = 0
         self.registro_fotos_dist = 0
@@ -143,7 +140,8 @@ class SistemaReconocimientoFacial:
         self.ultimo_registro_asistencia = {}
         self.ultimo_chat_voz = {}
 
-        # --- ESCUCHA CONTINUA EN SEGUNDO PLANO (SIEMPRE ESCUCHANDO EN RAM - CVE 2.0) ---
+        # --- ESCUCHA CONTINUA EN SEGUNDO PLANO (RAM - CVE 2.0) ---
+        self.umbral_silencio = 0.025  # Umbral base por defecto (calibrado en bucle_escucha_continua)
         self.stop_listener = False
         self.hilo_escucha = threading.Thread(target=self.bucle_escucha_continua, daemon=True)
         self.hilo_escucha.start()
@@ -163,7 +161,7 @@ class SistemaReconocimientoFacial:
         return None
 
     def generar_frase_llm(self, tipo, nombre=None, texto_conversacion=None):
-        """Genera una frase contextual usando Groq Llama-3 con mayor margen de timeout contra lags de red."""
+        """Genera una frase contextual usando Groq Llama-3."""
         if not self.groq_key:
             if tipo == "chat":
                 return "No tengo conexión a internet para charlar en este momento."
@@ -217,7 +215,6 @@ class SistemaReconocimientoFacial:
                 "max_tokens": 45,
                 "temperature": 0.85
             }
-            # Incrementado timeout a 3.5 segundos para tolerar fluctuaciones de la conexión wifi/red local
             res = requests.post(url, headers=headers, json=data, timeout=3.5)
             if res.status_code == 200:
                 result = res.json()
@@ -342,12 +339,21 @@ class SistemaReconocimientoFacial:
         hilo.start()
 
     def array_to_wav_bytes(self, audio_data):
-        """Convierte datos NumPy float32 a un archivo WAV PCM en memoria (RAM)."""
+        """
+        Convierte datos NumPy float32 a un archivo WAV PCM en memoria (RAM).
+        Aplica Normalización automática de ganancia (AGC) para amplificar voces bajas.
+        """
         wav_buffer = io.BytesIO()
         with wave.open(wav_buffer, 'wb') as wav_file:
             wav_file.setnchannels(1)
             wav_file.setsampwidth(2)  # 16-bit
             wav_file.setframerate(16000)
+            
+            # --- MEJORA AUDIO: Normalización de Ganancia Automática (AGC) ---
+            max_val = np.max(np.abs(audio_data))
+            if max_val > 1e-5:
+                audio_data = audio_data / max_val
+                
             audio_int = (audio_data * 32767.0).astype(np.int16)
             wav_file.writeframes(audio_int.tobytes())
         wav_buffer.seek(0)
@@ -383,29 +389,51 @@ class SistemaReconocimientoFacial:
         except Exception as e:
             print(f"[Barge-in Error] {e}")
 
+    def calibrar_microfono(self, stream, chunk_size):
+        """Escucha el ruido ambiental durante 1.5 segundos para autocalibrar el umbral VAD."""
+        print("[SISTEMA VOZ] Calibrando micrófono... Por favor, guarda silencio.")
+        lecturas = []
+        for _ in range(15):
+            try:
+                data, overflow = stream.read(chunk_size)
+                rms = np.sqrt(np.mean(data**2))
+                lecturas.append(rms)
+            except:
+                pass
+        
+        if lecturas:
+            avg_noise = np.mean(lecturas)
+            # Umbral dinámico: 1.6 veces el ruido ambiental. Límite seguro [0.015, 0.065]
+            self.umbral_silencio = max(0.015, min(avg_noise * 1.6, 0.065))
+            print(f"[SISTEMA VOZ] Calibración completa. Umbral VAD establecido en: {self.umbral_silencio:.4f}")
+        else:
+            self.umbral_silencio = 0.025
+            print("[SISTEMA VOZ] Falló lectura de calibración. Usando umbral por defecto (0.025)")
+
     def bucle_escucha_continua(self):
         """
         Bucle infinito en segundo plano (Siempre escuchando en memoria RAM - CVE 2.0).
-        Abre el sd.InputStream una sola vez para evitar interrupciones en los hilos del audio del sistema.
+        Abre el sd.InputStream una sola vez y realiza calibración automática de ruido.
         """
         sample_rate = 16000
         chunk_size = int(sample_rate * 0.1)  # Bloques de 100ms
-        umbral_silencio = 0.025
         
-        time.sleep(2.0)
+        time.sleep(1.0)
         pythoncom.CoInitialize()
         
         try:
-            # --- SOLUCIÓN DE AUDIO CORTADO: Abrir el stream UNA sola vez al inicio del hilo ---
             with sd.InputStream(samplerate=sample_rate, channels=1, blocksize=chunk_size) as stream:
+                # Autocalibrar el micrófono al abrir el flujo
+                self.calibrar_microfono(stream, chunk_size)
+                
                 while not self.stop_listener:
                     # 1. Si la IA está hablando físicamente, monitoreamos si el usuario la interrumpe (Barge-in)
                     if asistente_hablando:
                         try:
                             data, overflow = stream.read(chunk_size)
                             rms = np.sqrt(np.mean(data**2))
-                            # Umbral de Barge-in aumentado a 0.12 para evitar auto-disparos acústicos
-                            if rms > 0.12:
+                            # Umbral de Barge-in dinámico
+                            if rms > (self.umbral_silencio * 3.5):
                                 self.detener_habla()
                         except:
                             pass
@@ -421,8 +449,8 @@ class SistemaReconocimientoFacial:
                         data, overflow = stream.read(chunk_size)
                         rms = np.sqrt(np.mean(data**2))
                         
-                        if rms > umbral_silencio:
-                            print("[VAD] Detección de inicio de habla...")
+                        if rms > self.umbral_silencio:
+                            print(f"[VAD] Habla detectada (RMS: {rms:.4f} > Umbral: {self.umbral_silencio:.4f}). Graba...")
                             audio_chunks = [data]
                             silencio_consecutivo = 0
                             
@@ -434,7 +462,7 @@ class SistemaReconocimientoFacial:
                                 audio_chunks.append(chunk)
                                 
                                 c_rms = np.sqrt(np.mean(chunk**2))
-                                if c_rms > umbral_silencio:
+                                if c_rms > self.umbral_silencio:
                                     silencio_consecutivo = 0
                                 else:
                                     silencio_consecutivo += 1
@@ -446,11 +474,10 @@ class SistemaReconocimientoFacial:
                             if asistente_hablando:
                                 continue
                                 
-                            # Consolidar grabación
+                            # Consolidar y enviar a Whisper
                             audio_data = np.concatenate(audio_chunks, axis=0)
                             wav_bytes = self.array_to_wav_bytes(audio_data)
                             
-                            # Transcripción directa en memoria
                             texto_entendido = self.transcribir_groq_whisper(wav_bytes)
                             if texto_entendido:
                                 print(f"[Whisper Transcripción] Entendido: '{texto_entendido}'")
@@ -639,20 +666,15 @@ class SistemaReconocimientoFacial:
         longitud_linea = int(w * 0.2)
         grosor = 3
         
-        # Arriba Izquierda
         cv2.line(frame, (x, y), (x + longitud_linea, y), color, gromosor := grosor)
         cv2.line(frame, (x, y), (x, y + longitud_linea), color, gromosor)
-        # Arriba Derecha
         cv2.line(frame, (x + w, y), (x + w - longitud_linea, y), color, gromosor)
         cv2.line(frame, (x + w, y), (x + w, y + longitud_linea), color, gromosor)
-        # Abajo Izquierda
         cv2.line(frame, (x, y + h), (x + longitud_linea, y + h), color, gromosor)
         cv2.line(frame, (x, y + h), (x, y + h - longitud_linea), color, gromosor)
-        # Abajo Derecha
         cv2.line(frame, (x + w, y + h), (x + w - longitud_linea, y + h), color, gromosor)
         cv2.line(frame, (x + w, y + h), (x + w, y + h - longitud_linea), color, gromosor)
 
-        # Transparencia
         overlay = frame.copy()
         cv2.rectangle(overlay, (x, y), (x+w, y+h), color, 1)
         velocidad_escaner = int((time.time() * 250) % h)
@@ -681,11 +703,11 @@ class SistemaReconocimientoFacial:
         fps = 0
         ultimo_guardado_interactivo = 0
         
-        print("\nSISTEMA INTELIGENTE DE RECONOCIMIENTO FACIAL INICIADO (PRECISIÓN EXTREMA Y MULTIUSUARIOS).")
+        print("\nSISTEMA INTELIGENTE DE RECONOCIMIENTO FACIAL INICIADO (MEDIAPIPE & WHISPER).")
         print("Modo Conversacional y Autónomo Activo:")
-        print("  - CVE-2.0: Escucha asíncrona en RAM mediante un único Stream abierto.")
-        print("  - VAD Inteligente: Segmentación automática por energía RMS de voz.")
-        print("  - Barge-in Activo: IA se interrumpe de forma limpia al hablar.")
+        print("  - Detección de Rostros: Google MediaPipe (Rango completo 0 a 5 metros).")
+        print("  - Estimación de Pose: Asimetría geométrica por landmarks en tiempo real.")
+        print("  - Audio: Calibración dinámica de ruido ambiental y ganancia automática AGC.")
         print("  - Presione 'Q' en la pantalla del video para salir.")
         print("-" * 60)
         
@@ -712,32 +734,53 @@ class SistemaReconocimientoFacial:
             alto_red = h_orig // escala
             frame_pequeno = cv2.resize(frame, (ancho_red, alto_red))
             
+            # MediaPipe requiere formato RGB
+            rgb_frame = cv2.cvtColor(frame_pequeno, cv2.COLOR_BGR2RGB)
+            results = self.face_detector.process(rgb_frame)
+            
+            # Convertir frame de búsqueda a escala de grises para el clasificador LBPH
             gris = cv2.cvtColor(frame_pequeno, cv2.COLOR_BGR2GRAY)
             gris_opt = self.clahe.apply(gris)
             
-            # Detectores de Rostros
-            caras_frontales = self.face_cascade.detectMultiScale(
-                gris_opt, 
-                scaleFactor=1.08, 
-                minNeighbors=4, 
-                minSize=(20, 20)
-            )
-            
-            caras_perfil = []
-            if len(caras_frontales) == 0:
-                caras_perfil = self.profile_cascade.detectMultiScale(
-                    gris_opt,
-                    scaleFactor=1.08,
-                    minNeighbors=4,
-                    minSize=(20, 20)
-                )
-            
-            # Consolidar caras
             caras_combinadas = []
-            for (xf, yf, wf, hf) in caras_frontales:
-                caras_combinadas.append((xf, yf, wf, hf, True))
-            for (xp, yp, wp, hp) in caras_perfil:
-                caras_combinadas.append((xp, yp, wp, hp, False))
+            
+            # --- PROCESAR DETECCIONES DE MEDIAPIPE ---
+            if results.detections:
+                for detection in results.detections:
+                    bbox = detection.location_data.relative_bounding_box
+                    
+                    x_peq = int(bbox.xmin * ancho_red)
+                    y_peq = int(bbox.ymin * alto_red)
+                    w_peq = int(bbox.width * ancho_red)
+                    h_peq = int(bbox.height * alto_red)
+                    
+                    # Forzar límites
+                    x_peq = max(0, x_peq)
+                    y_peq = max(0, y_peq)
+                    w_peq = min(w_peq, ancho_red - x_peq)
+                    h_peq = min(h_peq, alto_red - y_peq)
+                    
+                    if w_peq > 15 and h_peq > 15:
+                        # --- ESTIMACIÓN DE POSE POR LANDMARKS GEOMÉTRICOS ---
+                        keypoints = detection.location_data.relative_keypoints
+                        es_frontal = True
+                        
+                        if len(keypoints) >= 3:
+                            kp_ojo_izq = keypoints[0]  # Ojo izquierdo en imagen (derecho de la persona)
+                            kp_ojo_der = keypoints[1]  # Ojo derecho en imagen (izquierdo de la persona)
+                            kp_nariz = keypoints[2]
+                            
+                            dist_ojos = kp_ojo_der.x - kp_ojo_izq.x
+                            dist_nariz_izq = kp_nariz.x - kp_ojo_izq.x
+                            
+                            if dist_ojos > 1e-5:
+                                ratio = dist_nariz_izq / dist_ojos
+                                # Si la nariz está centrada entre ambos ojos, la pose es frontal.
+                                # De lo contrario, se cataloga como perfil (giro de cabeza).
+                                if ratio < 0.35 or ratio > 0.65:
+                                    es_frontal = False
+                        
+                        caras_combinadas.append((x_peq, y_peq, w_peq, h_peq, es_frontal))
             
             cara_detectada_este_frame = len(caras_combinadas) > 0
             
@@ -871,6 +914,7 @@ class SistemaReconocimientoFacial:
                 if self.registro_estado is None and self.chat_estado is None:
                     if self.modelo_cargado:
                         try:
+                            # Preprocesamiento avanzado de rostros
                             cara_gris_norm = self.preprocesar_rostro_extremo(cara_gris_recortada)
                             
                             id_prediccion, distancia = self.recognizer.predict(cara_gris_norm)
@@ -961,6 +1005,7 @@ class SistemaReconocimientoFacial:
             if key == ord('q') or key == ord('Q'):
                 print("\n[SISTEMA] Cerrando aplicación y liberando recursos...")
                 self.stop_listener = True
+                self.face_detector.close()
                 break
                 
         cap.release()
