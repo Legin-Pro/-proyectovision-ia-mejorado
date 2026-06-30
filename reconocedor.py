@@ -180,6 +180,40 @@ class SistemaReconocimientoFacial:
                 print(f"[WARN] No se pudo leer .env: {e}")
         return None
 
+    def obtener_mejor_dispositivo_entrada(self):
+        """Busca el mejor dispositivo de entrada de audio físico disponible, evitando micrófonos virtuales como Oculus."""
+        try:
+            devices = sd.query_devices()
+            default_in = sd.default.device[0]
+            
+            default_name = devices[default_in]['name'].lower() if default_in >= 0 else ""
+            
+            # Si el micrófono por defecto es el de Oculus (VR) o no hay dispositivo por defecto
+            if "oculus" in default_name or default_in < 0:
+                print("[AUDIO DIAGNÓSTICO] El micrófono por defecto es Oculus (Virtual). Buscando micrófono físico...")
+                # Buscar alternativas físicas como Realtek, Intel, Smart Sound, Micrófono
+                for i, dev in enumerate(devices):
+                    if dev['max_input_channels'] > 0:
+                        name = dev['name'].lower()
+                        # Excluir dispositivos virtuales conocidos y mezclas estéreo
+                        if "oculus" not in name and "mezcla" not in name and "stereo mix" not in name:
+                            if "realtek" in name or "intel" in name or "micr" in name or "smart" in name:
+                                print(f"[AUDIO] Seleccionado micrófono físico automáticamente: {dev['name']} (ID: {i})")
+                                return i
+                
+                # Segunda opción: primer micrófono de entrada disponible que no sea Oculus
+                for i, dev in enumerate(devices):
+                    if dev['max_input_channels'] > 0:
+                        name = dev['name'].lower()
+                        if "oculus" not in name:
+                            print(f"[AUDIO] Seleccionado dispositivo genérico: {dev['name']} (ID: {i})")
+                            return i
+            
+            return default_in
+        except Exception as e:
+            print(f"[AUDIO ERROR] Error al buscar dispositivo de entrada: {e}")
+            return None
+
     def generar_frase_llm(self, tipo, nombre=None, texto_conversacion=None):
         """Genera una frase contextual usando Groq Llama-3."""
         if not self.groq_key:
@@ -441,7 +475,8 @@ class SistemaReconocimientoFacial:
         pythoncom.CoInitialize()
         
         try:
-            with sd.InputStream(samplerate=sample_rate, channels=1, blocksize=chunk_size) as stream:
+            id_mic = self.obtener_mejor_dispositivo_entrada()
+            with sd.InputStream(device=id_mic, samplerate=sample_rate, channels=1, blocksize=chunk_size) as stream:
                 self.calibrar_microfono(stream, chunk_size)
                 
                 while not self.stop_listener:
