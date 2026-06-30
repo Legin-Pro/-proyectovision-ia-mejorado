@@ -160,6 +160,8 @@ class SistemaReconocimientoFacial:
         self.predicciones_activas = {}
         self.ultimo_tiempo_clasificacion = {}
         self.eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_eye.xml')
+        self.smile_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_smile.xml')
+        self.cajas_suavizadas = {}
         self.roi_box = None
         self.contador_frames = 0
         self.roi_fail_count = 0
@@ -391,48 +393,85 @@ class SistemaReconocimientoFacial:
                         print(f"[ERROR] No se pudo limpiar la carpeta {d}: {e}")
 
     def alinear_rostro_ojos(self, rostro_gris):
-        """Detecta los ojos usando Haar Cascades y rota la imagen para alinearlos horizontalmente."""
+        """Detecta ojos y boca para realizar una alineación afín biométrica precisa por 3 puntos."""
+        h, w = rostro_gris.shape
+        
+        # 1. Detectar ojos
         ojos = self.eye_cascade.detectMultiScale(rostro_gris, scaleFactor=1.1, minNeighbors=4, minSize=(15, 15))
+        
+        # 2. Detectar boca/sonrisa (en la mitad inferior de la cara para evitar cejas/sombras)
+        mitad_inferior = rostro_gris[h//2:h, 0:w]
+        bocas = self.smile_cascade.detectMultiScale(mitad_inferior, scaleFactor=1.16, minNeighbors=20, minSize=(25, 15))
+        
+        # Coordenadas por defecto
+        ojo_izq_p = None
+        ojo_der_p = None
+        boca_p = None
+        
         if len(ojos) >= 2:
-            # Ordenar ojos por posición X para identificar el izquierdo y el derecho
             ojos = sorted(ojos, key=lambda o: o[0])
             ojo_izq, ojo_der = ojos[0], ojos[1]
+            ojo_izq_p = (float(ojo_izq[0] + ojo_izq[2] / 2.0), float(ojo_izq[1] + ojo_izq[3] / 2.0))
+            ojo_der_p = (float(ojo_der[0] + ojo_der[2] / 2.0), float(ojo_der[1] + ojo_der[3] / 2.0))
             
-            # Centro de cada ojo
-            izq_x = ojo_izq[0] + ojo_izq[2] // 2
-            izq_y = ojo_izq[1] + ojo_izq[3] // 2
-            der_x = ojo_der[0] + ojo_der[2] // 2
-            der_y = ojo_der[1] + ojo_der[3] // 2
+        if len(bocas) > 0:
+            # Seleccionar la boca más grande detectada y sumarle el offset vertical (h // 2)
+            bocas = sorted(bocas, key=lambda b: b[2] * b[3], reverse=True)
+            b = bocas[0]
+            boca_p = (float(b[0] + b[2] / 2.0), float(b[1] + b[3] / 2.0 + h / 2.0))
             
-            # Calcular ángulo
-            dy = der_y - izq_y
-            dx = der_x - izq_x
+        # Si tenemos los 3 puntos clave (ojos y boca), hacemos alineación afín de 3 puntos (Affine Warp)
+        if ojo_izq_p is not None and ojo_der_p is not None and boca_p is not None:
+            # Definir puntos de origen
+            pts_origen = np.float32([ojo_izq_p, ojo_der_p, boca_p])
+            
+            # Definir puntos de destino ideales estructurados
+            # Ojo izquierdo a 30% X, Ojo derecho a 70% X, ambos a 35% Y. Boca a 50% X, 75% Y.
+            pts_destino = np.float32([
+                [w * 0.30, h * 0.35],
+                [w * 0.70, h * 0.35],
+                [w * 0.50, h * 0.75]
+            ])
+            
+            # Matriz afín de 3 puntos
+            M = cv2.getAffineTransform(pts_origen, pts_destino)
+            rostro_alineado = cv2.warpAffine(rostro_gris, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+            return rostro_alineado
+            
+        # Fallback a alineación clásica por 2 ojos
+        elif ojo_izq_p is not None and ojo_der_p is not None:
+            dy = ojo_der_p[1] - ojo_izq_p[1]
+            dx = ojo_der_p[0] - ojo_izq_p[0]
             angulo = np.degrees(np.arctan2(dy, dx))
-            
-            # Centro de rotación (OpenCV requiere flotantes en Point2f)
-            centro = (float((izq_x + der_x) / 2.0), float((izq_y + der_y) / 2.0))
-            
-            # Rotar
-            h, w = rostro_gris.shape
+            centro = (float((ojo_izq_p[0] + ojo_der_p[0]) / 2.0), float((ojo_izq_p[1] + ojo_der_p[1]) / 2.0))
             M = cv2.getRotationMatrix2D(centro, angulo, scale=1.0)
             rostro_rotado = cv2.warpAffine(rostro_gris, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
             return rostro_rotado
+            
         return rostro_gris
 
-    def preprocesar_rostro_extremo(self, rostro_gris):
-        """Aplica un pipeline avanzado para maximizar la nitidez de facciones."""
-        # 1. Alinear ojos si es posible
+    def preprocesar_rostro_escala(self, rostro_gris, zoom_factor=1.0):
+        """Aplica preprocesamiento con un factor de zoom específico para aumentar el dataset."""
         rostro_alineado = self.alinear_rostro_ojos(rostro_gris)
-        
         h, w = rostro_alineado.shape
-        margin_x = int(w * 0.08)
-        margin_y = int(h * 0.08)
+        
+        # Ajustar los márgenes de corte basados en el zoom_factor
+        # Si factor = 1.0 -> 0.08 de margen. Si factor = 1.1 -> 0.13 de margen. Si factor = 0.9 -> 0.03 de margen.
+        factor_margen = 0.08 + (zoom_factor - 1.0) * 0.5
+        factor_margen = max(0.01, min(0.20, factor_margen)) # Limitar entre 1% y 20%
+        
+        margin_x = int(w * factor_margen)
+        margin_y = int(h * factor_margen)
         
         cara_recortada = rostro_alineado[margin_y:h-margin_y, margin_x:w-margin_x]
         cara_suave = cv2.bilateralFilter(cara_recortada, d=5, sigmaColor=50, sigmaSpace=50)
         cara_ecualizada = self.clahe.apply(cara_suave)
         
         return cv2.resize(cara_ecualizada, (WIDTH_RESIZE, HEIGHT_RESIZE), interpolation=cv2.INTER_CUBIC)
+
+    def preprocesar_rostro_extremo(self, rostro_gris):
+        """Aplica un pipeline avanzado para maximizar la nitidez de facciones."""
+        return self.preprocesar_rostro_escala(rostro_gris, zoom_factor=1.0)
 
     def clasificar_rostro_async(self, face_id, cara_gris_crop):
         """Clasifica un rostro recortado en segundo plano de manera asíncrona para evitar tirones."""
@@ -885,7 +924,7 @@ class SistemaReconocimientoFacial:
             self.entrenar_en_segundo_plano()
 
     def procesar_captura_pasiva(self, rostro_gris):
-        """Guarda silenciosa e implícitamente las caras aplicando normalización extrema y asíncrona por pasos/poses."""
+        """Guarda silenciosa e implícitamente las caras aplicando validación de pose y aumento de datos piramidal."""
         if self.registro_nombre is None or self.registro_estado != "capturando_dinamico":
             return
             
@@ -895,10 +934,71 @@ class SistemaReconocimientoFacial:
             
         ahora = time.time()
         
-        # Controlar la velocidad de captura (mínimo 400ms entre fotos de la misma pose para dar tiempo a micro-variaciones)
+        # Controlar la velocidad de captura (mínimo 400ms entre fotos de la misma pose)
         if ahora - self.ultimo_tiempo_foto < 0.40:
             return
             
+        # 1. FQA estricto para registro facial (descartar frames borrosos)
+        var_nitidez = 999.0
+        if rostro_gris.size > 0:
+            try:
+                var_nitidez = cv2.Laplacian(rostro_gris, cv2.CV_64F).var()
+            except:
+                pass
+        if var_nitidez < 110.0:
+            return # Demasiado borroso para entrenar
+            
+        # 2. Detector de ojos para validación geométrica de pose
+        ojos = self.eye_cascade.detectMultiScale(rostro_gris, scaleFactor=1.1, minNeighbors=4, minSize=(15, 15))
+        
+        # 3. Validación estricta de pose por pasos
+        if self.registro_paso in [1, 2]:  # Frente (serio o sonriendo)
+            if len(ojos) < 2:
+                return  # Requerir ambos ojos visibles
+                
+        elif self.registro_paso == 3:  # Perfil Izquierdo
+            if len(ojos) >= 2:
+                # Si ve dos ojos, evaluar asimetría horizontal
+                ojos = sorted(ojos, key=lambda o: o[0])
+                dist_izq = ojos[0][0]
+                dist_der = rostro_gris.shape[1] - (ojos[1][0] + ojos[1][2])
+                ratio = dist_izq / max(1.0, dist_der)
+                if ratio > 0.65:  # Demasiado simétrico (sigue de frente)
+                    return
+            elif len(ojos) == 1:
+                # Ojo visible en la mitad derecha (su ojo derecho)
+                ojo = ojos[0]
+                ojo_centro_x = ojo[0] + ojo[2] // 2
+                if ojo_centro_x < rostro_gris.shape[1] * 0.4:
+                    return
+            else:
+                return
+                
+        elif self.registro_paso == 4:  # Perfil Derecho
+            if len(ojos) >= 2:
+                ojos = sorted(ojos, key=lambda o: o[0])
+                dist_izq = ojos[0][0]
+                dist_der = rostro_gris.shape[1] - (ojos[1][0] + ojos[1][2])
+                ratio = dist_izq / max(1.0, dist_der)
+                if ratio < 1.54:  # Demasiado simétrico
+                    return
+            elif len(ojos) == 1:
+                # Ojo visible en la mitad izquierda (su ojo izquierdo)
+                ojo = ojos[0]
+                ojo_centro_x = ojo[0] + ojo[2] // 2
+                if ojo_centro_x > rostro_gris.shape[1] * 0.6:
+                    return
+            else:
+                return
+                
+        elif self.registro_paso == 5:  # Mirar hacia arriba
+            if len(ojos) >= 1:
+                promedio_y = sum(o[1] + o[3]//2 for o in ojos) / len(ojos)
+                if promedio_y > rostro_gris.shape[0] * 0.38:
+                    return  # Ojos muy abajo, no ha mirado hacia arriba
+            else:
+                return
+                
         self.ultimo_tiempo_foto = ahora
         
         ruta_usuario = os.path.join(DATASET_DIR, self.registro_nombre)
@@ -914,14 +1014,23 @@ class SistemaReconocimientoFacial:
                     except:
                         pass
                         
-        rostro_opt = self.preprocesar_rostro_extremo(rostro_gris)
+        # 4. Generar las 3 escalas del rostro (Aumento de datos piramidal)
+        rostro_opt = self.preprocesar_rostro_escala(rostro_gris, zoom_factor=1.0)
+        rostro_in = self.preprocesar_rostro_escala(rostro_gris, zoom_factor=1.1)
+        rostro_out = self.preprocesar_rostro_escala(rostro_gris, zoom_factor=0.9)
         
         self.registro_fotos_guardadas += 1
         self.registro_paso_fotos_guardadas += 1
         
-        archivo = os.path.join(ruta_usuario, f"{self.registro_nombre}_{self.registro_fotos_guardadas}.jpg")
-        # Escritura asíncrona en disco en un hilo daemon
-        threading.Thread(target=cv2.imwrite, args=(archivo, rostro_opt), daemon=True).start()
+        # Nombres de archivo
+        archivo_base = os.path.join(ruta_usuario, f"{self.registro_nombre}_{self.registro_fotos_guardadas}_std.jpg")
+        archivo_in = os.path.join(ruta_usuario, f"{self.registro_nombre}_{self.registro_fotos_guardadas}_in.jpg")
+        archivo_out = os.path.join(ruta_usuario, f"{self.registro_nombre}_{self.registro_fotos_guardadas}_out.jpg")
+        
+        # Escritura asíncrona
+        threading.Thread(target=cv2.imwrite, args=(archivo_base, rostro_opt), daemon=True).start()
+        threading.Thread(target=cv2.imwrite, args=(archivo_in, rostro_in), daemon=True).start()
+        threading.Thread(target=cv2.imwrite, args=(archivo_out, rostro_out), daemon=True).start()
         
         print(f"[REGISTRO PASIVO] Paso {self.registro_paso}/5 - Foto {self.registro_paso_fotos_guardadas}/3 Guardada ({self.registro_fotos_guardadas}/15)")
         
@@ -1038,7 +1147,7 @@ class SistemaReconocimientoFacial:
                             x_start = rx1 + int(detections[0, 0, i, 3] * roi_w)
                             y_start = ry1 + int(detections[0, 0, i, 4] * roi_h)
                             x_end = rx1 + int(detections[0, 0, i, 5] * roi_w)
-                            y_end = rx1 + int(detections[0, 0, i, 6] * roi_h)
+                            y_end = ry1 + int(detections[0, 0, i, 6] * roi_h)
                             
                             caras_combinadas.append((x_start, y_start, x_end - x_start, y_end - y_start))
                             
@@ -1248,6 +1357,18 @@ class SistemaReconocimientoFacial:
                 # Registrar posición actual en el tracker
                 self.tracker_rostros[face_id] = (cx, cy, ahora)
                 
+                # Suavizado de cajas del HUD mediante filtro paso bajo EMA
+                if face_id in self.cajas_suavizadas:
+                    prev_x, prev_y, prev_w, prev_h = self.cajas_suavizadas[face_id]
+                    x_draw = int(0.7 * prev_x + 0.3 * x)
+                    y_draw = int(0.7 * prev_y + 0.3 * y)
+                    w_draw = int(0.7 * prev_w + 0.3 * w)
+                    h_draw = int(0.7 * prev_h + 0.3 * h)
+                else:
+                    x_draw, y_draw, w_draw, h_draw = x, y, w, h
+                    
+                self.cajas_suavizadas[face_id] = (x_draw, y_draw, w_draw, h_draw)
+                
                 etiqueta = "Analizando..."
                 subtitulo = "Estimando pose..."
                 color = (0, 255, 255)
@@ -1288,7 +1409,7 @@ class SistemaReconocimientoFacial:
                         etiqueta = "DESCARTADO"
                         subtitulo = f"Borroso (FQA): {var_nitidez:.1f}"
                         color = (0, 165, 255)
-                        self.dibujar_hud_futurista(frame_original, x, y, w, h, etiqueta, subtitulo, color)
+                        self.dibujar_hud_futurista(frame_original, x_draw, y_draw, w_draw, h_draw, etiqueta, subtitulo, color)
                         continue
                         
                     # Lanzar clasificación asíncrona si ha pasado el intervalo (4 veces por segundo por rostro)
@@ -1359,7 +1480,7 @@ class SistemaReconocimientoFacial:
                             self.iniciar_registro_autonomo()
                             self.consecutivos_desconocidos = 0
 
-                self.dibujar_hud_futurista(frame_original, x, y, w, h, etiqueta, subtitulo, color)
+                self.dibujar_hud_futurista(frame_original, x_draw, y_draw, w_draw, h_draw, etiqueta, subtitulo, color)
             
             self.cara_detectada_nombre = nombre_actual_en_camara
             
